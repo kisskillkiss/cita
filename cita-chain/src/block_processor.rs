@@ -29,22 +29,23 @@ pub struct BlockProcessor {
 
 impl BlockProcessor {
     pub fn new(chain: Arc<Chain>, ctx_pub: Sender<(String, Vec<u8>)>) -> Self {
-        BlockProcessor {
-            chain: chain,
-            ctx_pub: ctx_pub,
-        }
+        BlockProcessor { chain, ctx_pub }
     }
 
     pub fn broadcast_current_status(&self) {
         self.chain.broadcast_current_status(&self.ctx_pub);
     }
 
-    pub fn set_executed_result(&self, ret: ExecutedResult) {
-        self.chain.set_executed_result(&ret, &self.ctx_pub);
+    pub fn set_executed_result(&self, ret: &ExecutedResult) {
+        self.chain.set_executed_result(ret, &self.ctx_pub);
     }
 
     pub fn reset_max_store_height(&self) {
         self.chain
             .set_max_store_height(self.chain.get_current_height());
+    }
+
+    pub fn signal_to_executor(&self) {
+        self.chain.signal_to_executor(&self.ctx_pub)
     }
 }

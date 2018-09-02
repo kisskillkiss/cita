@@ -18,8 +18,7 @@
 use cita_types::traits::LowerHex;
 use cita_types::{clean_0x, Address, H256, U256};
 use crypto::{
-    pubkey_to_address, PubKey, Public, Signature, HASH_BYTES_LEN, PUBKEY_BYTES_LEN,
-    SIGNATURE_BYTES_LEN,
+    pubkey_to_address, PubKey, Signature, HASH_BYTES_LEN, PUBKEY_BYTES_LEN, SIGNATURE_BYTES_LEN,
 };
 use libproto::blockchain::{
     Crypto as ProtoCrypto, SignedTransaction as ProtoSignedTransaction,
@@ -212,18 +211,14 @@ impl Transaction {
             gas_price: U256::default(),
             gas: U256::from(plain_transaction.get_quota()),
             action: {
-                let to = plain_transaction.get_to();
-                match to.is_empty() {
-                    true => Action::Create,
-                    false => match to {
-                        STORE_ADDRESS => Action::Store,
-                        ABI_ADDRESS => Action::AbiStore,
-                        GO_CONTRACT => Action::GoCreate,
-                        AMEND_ADDRESS => Action::AmendData,
-                        _ => Action::Call(
-                            Address::from_str(clean_0x(to)).map_err(|_| Error::ParseError)?
-                        ),
-                    },
+                let to = clean_0x(plain_transaction.get_to());
+                match to {
+                    "" => Action::Create,
+                    STORE_ADDRESS => Action::Store,
+                    ABI_ADDRESS => Action::AbiStore,
+                    GO_CONTRACT => Action::GoCreate,
+                    AMEND_ADDRESS => Action::AmendData,
+                    _ => Action::Call(Address::from_str(to).map_err(|_| Error::ParseError)?),
                 }
             },
             value: U256::from(plain_transaction.get_value()),
@@ -252,12 +247,12 @@ impl Transaction {
         SignedTransaction {
             transaction: UnverifiedTransaction {
                 unsigned: self,
-                signature: signature,
+                signature,
                 hash: 0.into(),
                 crypto_type: CryptoType::default(),
             },
             sender: from,
-            public: Public::default(),
+            public: PubKey::default(),
         }
     }
 
@@ -354,7 +349,7 @@ impl UnverifiedTransaction {
             unsigned: Transaction::new(utx.get_transaction())?,
             signature: Signature::from(utx.get_signature()),
             crypto_type: CryptoType::from(utx.get_crypto()),
-            hash: hash,
+            hash,
         })
     }
 
@@ -397,7 +392,7 @@ impl UnverifiedTransaction {
 pub struct SignedTransaction {
     transaction: UnverifiedTransaction,
     sender: Address,
-    public: Public,
+    public: PubKey,
 }
 
 /// RLP dose not support struct nesting well
@@ -427,7 +422,7 @@ impl Decodable for SignedTransaction {
                 hash: d.val_at(11)?,
             },
             sender: pubkey_to_address(&public),
-            public: public,
+            public,
         })
     }
 }
@@ -490,8 +485,8 @@ impl SignedTransaction {
         let sender = pubkey_to_address(&public);
         Ok(SignedTransaction {
             transaction: UnverifiedTransaction::new(stx.get_transaction_with_sig(), tx_hash)?,
-            sender: sender,
-            public: public,
+            sender,
+            public,
         })
     }
 
@@ -511,7 +506,7 @@ impl SignedTransaction {
     }
 
     /// Returns a public key of the sender.
-    pub fn public_key(&self) -> &Public {
+    pub fn public_key(&self) -> &PubKey {
         &self.public
     }
 

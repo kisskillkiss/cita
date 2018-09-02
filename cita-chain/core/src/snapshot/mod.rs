@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use util::kvdb::{DBTransaction, KeyValueDB};
-use util::{sha3, snappy, Bytes, Mutex, BLOCKLIMIT};
+use util::{snappy, Bytes, Hashable, Mutex, BLOCKLIMIT};
 
 use basic_types::{LogBloom, LogBloomGroup};
 use bloomchain::group::BloomGroupChain;
@@ -57,7 +57,7 @@ use types::ids::BlockId;
 
 use libchain::block::{Block, BlockBody};
 use libchain::chain::Chain;
-use libchain::extras::{BlockReceipts, CurrentHash, CurrentHeight, LogGroupPosition};
+use libchain::extras::{BlockReceipts, CurrentHash, CurrentHeight, CurrentProof, LogGroupPosition};
 
 use libproto::Proof;
 
@@ -128,7 +128,7 @@ pub struct ManifestData {
 /// Snapshot manifest encode/decode.
 impl ManifestData {
     /// Encode the manifest data to rlp.
-    pub fn to_rlp(self) -> Bytes {
+    pub fn to_rlp(&self) -> Bytes {
         let mut stream = RlpStream::new_list(4);
         stream.append_list(&self.block_hashes);
         stream.append(&self.state_root);
@@ -150,11 +150,11 @@ impl ManifestData {
         let last_proof: Proof = decoder.val_at(4)?;
 
         Ok(ManifestData {
-            block_hashes: block_hashes,
-            state_root: state_root,
-            block_number: block_number,
-            block_hash: block_hash,
-            last_proof: last_proof,
+            block_hashes,
+            state_root,
+            block_number,
+            block_hash,
+            last_proof,
         })
     }
 }
@@ -170,7 +170,7 @@ pub fn take_snapshot<W: SnapshotWriter + Send>(
 
     let start_header = chain
         .block_header_by_hash(block_hash)
-        .ok_or(Error::InvalidStartingBlock(BlockId::Hash(block_hash)))?;
+        .ok_or_else(|| Error::InvalidStartingBlock(BlockId::Hash(block_hash)))?;
     let state_root = start_header.state_root();
 
     info!("Taking snapshot starting at block {}", block_at);
@@ -181,19 +181,18 @@ pub fn take_snapshot<W: SnapshotWriter + Send>(
     info!("produced {} block chunks.", block_hashes.len());
 
     // get last_proof from chain, it will be used by cita-bft when restoring.
-    let last_proof: Proof;
-    if block_at == chain.get_current_height() {
-        last_proof = chain.current_block_poof().unwrap();
+    let last_proof = if block_at == chain.get_current_height() {
+        chain.current_block_poof()
     } else {
-        last_proof = chain.get_block_proof_by_height(block_at).unwrap();
-    }
+        chain.get_block_proof_by_height(block_at)
+    }.unwrap();
 
     let manifest_data = ManifestData {
-        block_hashes: block_hashes,
+        block_hashes,
         state_root: *state_root,
         block_number: block_at,
-        block_hash: block_hash,
-        last_proof: last_proof,
+        block_hash,
+        last_proof,
     };
 
     writer.into_inner().finish(manifest_data)?;
@@ -217,11 +216,11 @@ pub fn chunk_secondary<'a>(
         let mut chunk_sink = |raw_data: &[u8]| {
             compressed_data.clear();
             snappy::compress_to(raw_data, &mut compressed_data)?;
-            let hash = H256::from_slice(&sha3::keccak256(&compressed_data));
+            let hash = compressed_data.crypt_hash();
             let size = compressed_data.len();
 
             writer.lock().write_block_chunk(hash, &compressed_data)?;
-            trace!(
+            info!(
                 "wrote secondary chunk. hash: {:?}, size: {}, uncompressed size: {}",
                 hash,
                 size,
@@ -234,7 +233,7 @@ pub fn chunk_secondary<'a>(
         };
 
         BlockChunker {
-            chain: chain,
+            chain,
             rlps: VecDeque::new(),
             current_hash: start_hash,
             writer: &mut chunk_sink,
@@ -262,12 +261,22 @@ impl<'a> BlockChunker<'a> {
         let mut loaded_size = 0;
         let mut last = self.current_hash;
 
+        let start_header = self
+            .chain
+            .block_header_by_hash(self.current_hash)
+            .ok_or_else(|| Error::BlockNotFound(self.current_hash))?;
+        let step = if start_header.number() < 100 {
+            1
+        } else {
+            start_header.number() / 100
+        };
+
         let genesis_hash = self
             .chain
             .block_hash_by_height(0)
             .expect("Genesis hash should always exist");
-        trace!("Genesis_hash: {:?}", genesis_hash);
-        let mut tx_hashes_num = 0;
+        info!("Genesis_hash: {:?}", genesis_hash);
+        let mut blocks_num = 0;
 
         loop {
             if self.current_hash == genesis_hash {
@@ -283,39 +292,39 @@ impl<'a> BlockChunker<'a> {
             let header = self
                 .chain
                 .block_header_by_hash(self.current_hash)
-                .ok_or(Error::BlockNotFound(self.current_hash))?;
+                .ok_or_else(|| Error::BlockNotFound(self.current_hash))?;
             header.clone().rlp_append(&mut s);
             let header_rlp = s.out();
 
-            trace!("current height: {:?}", header.number());
+            if blocks_num % step == 0 {
+                info!("current height: {:?}", header.number());
+            }
 
-            let receipts = match self.chain.block_receipts(self.current_hash) {
-                Some(r) => r.receipts,
-                _ => Vec::new(),
-            };
-
-            let pair: Vec<u8> = if tx_hashes_num < BLOCKLIMIT {
-                let tx_hashes = match self
-                    .chain
-                    .transaction_hashes(BlockId::Hash(self.current_hash))
-                {
-                    Some(hashes) => hashes,
-                    _ => Vec::new(),
+            let pair: Vec<u8> = if blocks_num < BLOCKLIMIT {
+                let body_rlp = {
+                    let body: BlockBody = self
+                        .chain
+                        .block_body(BlockId::Hash(self.current_hash))
+                        .ok_or_else(|| Error::BlockNotFound(self.current_hash))?;
+                    let mut s = RlpStream::new();
+                    body.rlp_append(&mut s);
+                    s.out()
                 };
 
-                tx_hashes_num += 1;
+                let receipts = match self.chain.block_receipts(self.current_hash) {
+                    Some(r) => r.receipts,
+                    _ => Vec::new(),
+                };
 
                 let mut pair_stream = RlpStream::new_list(3);
                 pair_stream
                     .append_raw(&header_rlp, 1)
                     .append_list(&receipts)
-                    .append_list(&tx_hashes);
+                    .append_raw(&body_rlp, 1);
                 pair_stream.out()
             } else {
-                let mut pair_stream = RlpStream::new_list(2);
-                pair_stream
-                    .append_raw(&header_rlp, 1)
-                    .append_list(&receipts);
+                let mut pair_stream = RlpStream::new_list(1);
+                pair_stream.append_raw(&header_rlp, 1);
                 pair_stream.out()
             };
 
@@ -333,6 +342,8 @@ impl<'a> BlockChunker<'a> {
 
             last = self.current_hash;
             self.current_hash = *header.parent_hash();
+
+            blocks_num += 1;
         }
 
         if loaded_size != 0 {
@@ -352,7 +363,7 @@ impl<'a> BlockChunker<'a> {
         let last_header = self
             .chain
             .block_header_by_hash(last)
-            .ok_or(Error::BlockNotFound(last))?;
+            .ok_or_else(|| Error::BlockNotFound(last))?;
 
         let parent_number = last_header.number() - 1;
         let parent_hash = last_header.parent_hash();
@@ -408,6 +419,7 @@ pub struct BlockRebuilder {
     best_number: u64,
     best_hash: H256,
     best_root: H256,
+    cur_proof: Proof,
     fed_blocks: u64,
     snapshot_blocks: u64,
 }
@@ -421,14 +433,15 @@ impl BlockRebuilder {
         snapshot_blocks: u64,
     ) -> Self {
         BlockRebuilder {
-            chain: chain,
-            db: db.clone(),
+            chain,
+            db,
             //_disconnected: Vec::new(),
             best_number: manifest.block_number,
             best_hash: manifest.block_hash,
             best_root: manifest.state_root,
+            cur_proof: manifest.last_proof.clone(),
             fed_blocks: 0,
-            snapshot_blocks: snapshot_blocks,
+            snapshot_blocks,
         }
     }
 
@@ -437,7 +450,7 @@ impl BlockRebuilder {
         let rlp = UntrustedRlp::new(chunk);
         let item_count = rlp.item_count()?;
         let num_blocks = (item_count - 2) as u64;
-        trace!("restoring block chunk with {} blocks.", num_blocks);
+        info!("restoring block chunk with {} blocks.", num_blocks);
 
         if self.fed_blocks + num_blocks > self.snapshot_blocks {
             info!(
@@ -458,17 +471,27 @@ impl BlockRebuilder {
                 return Err(Error::RestorationAborted.into());
             }
 
+            let mut block = Block::new();
             let pair = rlp.at(idx)?;
             //let block_rlp = pair.at(0)?.as_raw().to_owned();
             //let block: Block = ::rlp::decode(block_rlp.as_slice());
             let header_rlp = pair.at(0)?.as_raw().to_owned();
             let header: Header = ::rlp::decode(header_rlp.as_slice());
-            let block = Block {
-                header: header.clone(),
-                body: BlockBody::new(),
+            {
+                block.set_header(header.clone());
+            }
+
+            // if height + 100 < max_height, there will be bodies and receipts.
+            let mut have_body: bool = false;
+
+            let receipts: Vec<Receipt> = pair.list_at(1).unwrap_or_default();
+
+            if let Ok(b) = pair.at(2) {
+                have_body = true;
+                let body_rlp = b.as_raw().to_owned();
+                let body = ::rlp::decode(body_rlp.as_slice());
+                block.set_body(body);
             };
-            let receipts: Vec<Receipt> = pair.list_at(1)?;
-            let tx_hashes: Option<Vec<H256>> = pair.list_at(2).ok();
 
             // TODO: abridged_block
             /*let receipts_root = ordered_trie_root(pair.at(1)?.iter().map(|r| r.as_raw()));
@@ -495,7 +518,7 @@ impl BlockRebuilder {
 
             let mut batch = self.db.transaction();
 
-            self.insert_unordered_block(&mut batch, &block, receipts, tx_hashes, is_best);
+            self.insert_unordered_block(&mut batch, &block, receipts, have_body, is_best);
 
             self.db.write_buffered(batch);
 
@@ -516,40 +539,34 @@ impl BlockRebuilder {
         batch: &mut DBTransaction,
         block: &Block,
         receipts: Vec<Receipt>,
-        tx_hashes: Option<Vec<H256>>,
+        have_body: bool,
         is_best: bool,
     ) {
         let header = block.header();
-        //let body = block.body();
         let hash = header.hash();
         let height = header.number();
 
         // store block in db
         batch.write(COL_HEADERS, &height, &header.clone());
-        //batch.write(COL_BODIES, &height, &body.clone());
+        if have_body {
+            let body = block.body();
+            batch.write(COL_BODIES, &height, &body.clone());
+        }
 
         // COL_EXTRA
         let info = BlockInfo {
-            hash: hash,
+            hash,
             number: height,
         };
-
-        {
-            // Maybe tx hashes will be stored in DB in future.
-            if let Some(hashes) = tx_hashes {
-                let mut write_tx_hashes = self.chain.tx_hashes_cache.write();
-                write_tx_hashes.insert(info.number, hashes);
-            }
-        }
 
         self.prepare_update(
             batch,
             ExtrasUpdate {
                 block_hashes: self.prepare_block_hashes_update(block, &info),
-                block_receipts: self.prepare_block_receipts_update(receipts, &info),
+                block_receipts: self.prepare_block_receipts_update(receipts, &info, have_body),
                 blocks_blooms: self.prepare_block_blooms_update(block, &info),
                 //transactions_addresses: self.prepare_transaction_addresses_update(block, &info),
-                info: info,
+                info,
                 block: block.clone(),
             },
             is_best,
@@ -574,10 +591,13 @@ impl BlockRebuilder {
         &self,
         receipts: Vec<Receipt>,
         info: &BlockInfo,
+        have_body: bool,
     ) -> HashMap<H256, BlockReceipts> {
         let mut block_receipts = HashMap::new();
 
-        block_receipts.insert(info.hash, BlockReceipts::new(receipts));
+        if have_body {
+            block_receipts.insert(info.hash, BlockReceipts::new(receipts));
+        }
 
         block_receipts
     }
@@ -738,7 +758,7 @@ impl BlockRebuilder {
             block_hash: genesis_hash,
             proof: vec![],
         });*/
-        let genesis_block = self.chain.block_by_height(0).unwrap_or(Block::default());
+        let genesis_block = self.chain.block_by_height(0).unwrap_or_default();
         batch.write(COL_HEADERS, &0, &genesis_block.header.clone());
 
         batch.write(COL_BODIES, &0, &genesis_block.body.clone());
@@ -750,7 +770,7 @@ impl BlockRebuilder {
             genesis_block.body.clone(),
             CacheUpdatePolicy::Overwrite,
         );*/
-        //batch.write(COL_EXTRA, &CurrentProof, &update.info.hash);
+        batch.write(COL_EXTRA, &CurrentProof, &self.cur_proof);
 
         self.db.write_buffered(batch);
         Ok(())
@@ -760,7 +780,7 @@ impl BlockRebuilder {
 // helper for reading chunks from arbitrary reader and feeding them into the
 // service.
 pub fn restore_using<R: SnapshotReader>(
-    snapshot: Arc<Service>,
+    snapshot: &Arc<Service>,
     reader: &R,
     recover: bool,
 ) -> Result<(), String> {
@@ -804,7 +824,7 @@ pub fn restore_using<R: SnapshotReader>(
             )
         })?;
 
-        let hash = H256::from_slice(&sha3::keccak256(&chunk));
+        let hash = chunk.crypt_hash();
         if hash != block_hash {
             return Err(format!(
                 "Mismatched chunk hash. Expected {:?}, got {:?}",

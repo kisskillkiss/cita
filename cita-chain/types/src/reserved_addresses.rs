@@ -102,6 +102,7 @@ pub const GROUP_MANAGEMENT: &str = "ffffffffffffffffffffffffffffffffff02000a";
 pub const GROUP_CREATOR: &str = "ffffffffffffffffffffffffffffffffff02000b";
 pub const ADMIN: &str = "ffffffffffffffffffffffffffffffffff02000c";
 pub const ROLE_AUTH: &str = "ffffffffffffffffffffffffffffffffff02000d";
+pub const BATCH_TX: &str = "ffffffffffffffffffffffffffffffffff02000e";
 // Permission System Contracts
 pub const PERMISSION_SEND_TX: &str = "ffffffffffffffffffffffffffffffffff021000";
 pub const PERMISSION_CREATE_CONTRACT: &str = "ffffffffffffffffffffffffffffffffff021001";
@@ -118,6 +119,12 @@ pub const PERMISSION_CANCEL_ROLE: &str = "ffffffffffffffffffffffffffffffffff0210
 pub const PERMISSION_NEW_GROUP: &str = "ffffffffffffffffffffffffffffffffff02101a";
 pub const PERMISSION_DELETE_GROUP: &str = "ffffffffffffffffffffffffffffffffff02101b";
 pub const PERMISSION_UPDATE_GROUP: &str = "ffffffffffffffffffffffffffffffffff02101c";
+pub const PERMISSION_NEW_NODE: &str = "FfFfFFffFffffFffffffffFFFFffFfFFFF021020";
+pub const PERMISSION_DELETE_NODE: &str = "FffFFFfFfFFFfFfFfFfFFfffFFFFFffFFF021021";
+pub const PERMISSION_UPDATE_NODE: &str = "FffFfffFFffFFFFfFFFFFfFfFFFfFFFfFF021022";
+pub const PERMISSION_ACCOUNT_QUOTA: &str = "ffFfffFfffFfFFFFFfFfFffFFfFfffFffF021023";
+pub const PERMISSION_BLOCK_QUOTA: &str = "fffffFfFfFFfFFffFfFffFFFFfFFFfFffF021024";
+
 // Native Contracts
 pub const NATIVE_SIMPLE_STORAGE: &str = "ffffffffffffffffffffffffffffffffff030000";
 pub const NATIVE_ZK_PRIVACY: &str = "ffffffffffffffffffffffffffffffffff030001";

@@ -64,6 +64,7 @@ impl CodeState {
 // walk the account's storage trie, returning a vector of RLP items containing the
 // account address hash, account properties and the storage. Each item contains at most `max_storage_items`
 // storage records split according to snapshot format definition.
+#[allow(unknown_lints, implicit_hasher)] // TODO clippy
 pub fn to_fat_rlps(
     address: &Address,
     acc: &BasicAccount,
@@ -75,7 +76,7 @@ pub fn to_fat_rlps(
 ) -> Result<Vec<Bytes>, Error> {
     let db = TrieDB::new(acct_db, &acc.storage_root).unwrap();
     let mut chunks = Vec::new();
-    let mut db_iter = db.iter()?;
+    let mut db_iter = db.iter().map_err(|err| *err)?;
     let mut target_chunk_size = first_chunk_size;
     let mut account_stream = RlpStream::new_list(2);
     let mut leftover: Option<Vec<u8>> = None;
@@ -98,7 +99,7 @@ pub fn to_fat_rlps(
         } else {
             match acct_db.get(&acc.code_hash) {
                 Some(c) => {
-                    used_code.insert(acc.code_hash.clone());
+                    used_code.insert(acc.code_hash);
                     account_stream.append(&CodeState::Inline.raw()).append(&&*c);
                 }
                 None => {
@@ -120,7 +121,7 @@ pub fn to_fat_rlps(
         } else {
             match acct_db.get(&acc.abi_hash) {
                 Some(c) => {
-                    used_abi.insert(acc.abi_hash.clone());
+                    used_abi.insert(acc.abi_hash);
                     account_stream.append(&CodeState::Inline.raw()).append(&&*c);
                 }
                 None => {
@@ -163,7 +164,7 @@ pub fn to_fat_rlps(
                     }
                 }
                 Some(Err(e)) => {
-                    return Err(e.into());
+                    return Err((*e).into());
                 }
                 None => {
                     account_stream.complete_unbounded_list();
@@ -182,7 +183,7 @@ pub fn to_fat_rlps(
 // if it exists.
 pub fn from_fat_rlp(
     acct_db: &mut AccountDBMut,
-    rlp: UntrustedRlp,
+    rlp: &UntrustedRlp,
     mut storage_root: H256,
 ) -> Result<(BasicAccount, Option<Bytes>, Option<Bytes>), Error> {
     //use trie::{TrieDBMut, TrieMut};
@@ -240,23 +241,23 @@ pub fn from_fat_rlp(
         let mut storage_trie = if storage_root.is_zero() {
             TrieDBMut::new(acct_db, &mut storage_root)
         } else {
-            TrieDBMut::from_existing(acct_db, &mut storage_root)?
+            TrieDBMut::from_existing(acct_db, &mut storage_root).map_err(|err| *err)?
         };
         let pairs = rlp.at(6)?;
         for pair_rlp in pairs.iter() {
             let k: Bytes = pair_rlp.val_at(0)?;
             let v: Bytes = pair_rlp.val_at(1)?;
 
-            storage_trie.insert(&k, &v)?;
+            storage_trie.insert(&k, &v).map_err(|err| *err)?;
         }
     }
 
     let acc = BasicAccount {
-        nonce: nonce,
-        storage_root: storage_root,
-        code_hash: code_hash,
-        balance: balance,
-        abi_hash: abi_hash,
+        nonce,
+        storage_root,
+        code_hash,
+        balance,
+        abi_hash,
     };
 
     Ok((acc, new_code, new_abi))

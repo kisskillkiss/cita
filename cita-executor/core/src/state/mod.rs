@@ -20,14 +20,14 @@
 //! or rolled back.
 
 use cita_types::{Address, H256, U256};
-use contracts::Resource;
+use contracts::solc::Resource;
 use engines::Engine;
 use error::{Error, ExecutionError};
 use evm::env_info::EnvInfo;
 use evm::Error as EvmError;
 use executive::{Executive, TransactOptions};
 use factory::Factories;
-use libexecutor::executor::EconomicalModel;
+use libexecutor::executor::{CheckOptions, EconomicalModel};
 use receipt::{Receipt, ReceiptError};
 use rlp::{self, Encodable};
 use std::cell::{Ref, RefCell, RefMut};
@@ -97,6 +97,10 @@ impl AccountEntry {
         self.state == AccountState::Dirty
     }
 
+    pub fn is_commited(&self) -> bool {
+        self.state == AccountState::Committed
+    }
+
     fn exists_and_is_null(&self) -> bool {
         self.account.as_ref().map_or(false, |a| a.is_null())
     }
@@ -125,8 +129,8 @@ impl AccountEntry {
     // Create a new account entry and mark it as dirty.
     fn new_dirty(account: Option<Account>) -> AccountEntry {
         AccountEntry {
-            old_balance: account.as_ref().map(|a| a.balance().clone()),
-            account: account,
+            old_balance: account.as_ref().map(|a| *a.balance()),
+            account,
             state: AccountState::Dirty,
         }
     }
@@ -134,8 +138,8 @@ impl AccountEntry {
     // Create a new account entry and mark it as clean.
     fn new_clean(account: Option<Account>) -> AccountEntry {
         AccountEntry {
-            old_balance: account.as_ref().map(|a| a.balance().clone()),
-            account: account,
+            old_balance: account.as_ref().map(|a| *a.balance()),
+            account,
             state: AccountState::CleanFresh,
         }
     }
@@ -143,8 +147,8 @@ impl AccountEntry {
     // Create a new account entry and mark it as clean and cached.
     fn new_clean_cached(account: Option<Account>) -> AccountEntry {
         AccountEntry {
-            old_balance: account.as_ref().map(|a| a.balance().clone()),
-            account: account,
+            old_balance: account.as_ref().map(|a| *a.balance()),
+            account,
             state: AccountState::CleanCached,
         }
     }
@@ -283,7 +287,7 @@ pub enum CleanupMode<'a> {
     KillEmpty(&'a mut HashSet<Address>),
 }
 
-const SEC_TRIE_DB_UNWRAP_STR: &'static str =
+const SEC_TRIE_DB_UNWRAP_STR: &str =
     "A state can only be created with valid root.\
      Creating a SecTrieDB with a valid root will not fail.\
      Therefore creating a SecTrieDB with this state's root will not fail.";
@@ -327,12 +331,12 @@ impl<B: Backend> State<B> {
         }
 
         let state = State {
-            db: db,
-            root: root,
+            db,
+            root,
             cache: RefCell::new(HashMap::new()),
             checkpoints: RefCell::new(Vec::new()),
-            account_start_nonce: account_start_nonce,
-            factories: factories,
+            account_start_nonce,
+            factories,
             account_permissions: HashMap::new(),
             group_accounts: HashMap::new(),
             super_admin_account: None,
@@ -615,7 +619,7 @@ impl<B: Backend> State<B> {
     /// Get accounts' code.
     pub fn code(&self, a: &Address) -> trie::Result<Option<Arc<Bytes>>> {
         self.ensure_cached(a, RequireCache::Code, true, |a| {
-            a.as_ref().map_or(None, |a| a.code().clone())
+            a.as_ref().and_then(|a| a.code().clone())
         })
     }
 
@@ -636,7 +640,7 @@ impl<B: Backend> State<B> {
     /// Get accounts' ABI.
     pub fn abi(&self, a: &Address) -> trie::Result<Option<Arc<Bytes>>> {
         self.ensure_cached(a, RequireCache::Abi, true, |a| {
-            a.as_ref().map_or(None, |a| a.abi().clone())
+            a.as_ref().and_then(|a| a.abi().clone())
         })
     }
 
@@ -660,10 +664,8 @@ impl<B: Backend> State<B> {
         let is_value_transfer = !incr.is_zero();
         if is_value_transfer {
             self.require(a, false, false)?.add_balance(incr);
-        } else {
-            if self.exists(a)? {
-                self.touch(a)?;
-            }
+        } else if self.exists(a)? {
+            self.touch(a)?;
         }
         Ok(())
     }
@@ -760,21 +762,24 @@ impl<B: Backend> State<B> {
 
     /// Execute a given transaction.
     /// This will change the state accordingly.
+    #[allow(unknown_lints, too_many_arguments)] // TODO clippy
     pub fn apply(
         &mut self,
         env_info: &EnvInfo,
         engine: &Engine,
         t: &SignedTransaction,
         tracing: bool,
-        check_permission: bool,
-        check_quota: bool,
         economical_model: EconomicalModel,
+        chain_owner: Address,
+        check_options: &CheckOptions,
     ) -> ApplyResult {
         let options = TransactOptions {
-            tracing: tracing,
+            tracing,
             vm_tracing: false,
-            check_permission: check_permission,
-            check_quota: check_quota,
+            check_permission: check_options.permission,
+            check_quota: check_options.quota,
+            check_send_tx_permission: check_options.send_tx_permission,
+            check_create_contract_permission: check_options.create_contract_permission,
         };
         let vm_factory = self.factories.vm.clone();
         let native_factory = self.factories.native.clone();
@@ -787,7 +792,9 @@ impl<B: Backend> State<B> {
             &native_factory,
             false,
             economical_model,
-        ).transact(t, options)
+            check_options.fee_back_platform,
+            chain_owner,
+        ).transact(t, &options)
         {
             Ok(e) => {
                 // trace!("Applied transaction. Diff:\n{}\n", state_diff::diff_pod(&old, &self.to_pod()));
@@ -814,7 +821,7 @@ impl<B: Backend> State<B> {
                 );
                 trace!(target: "state", "Transaction receipt: {:?}", receipt);
                 Ok(ApplyOutcome {
-                    receipt: receipt,
+                    receipt,
                     trace: e.trace,
                 })
             }
@@ -847,7 +854,7 @@ impl<B: Backend> State<B> {
                 let tx_gas_used = match err {
                     ExecutionError::ExecutionInternal { .. } => t.gas,
                     _ => cmp::min(
-                        self.balance(&sender).unwrap_or(U256::from(0)),
+                        self.balance(&sender).unwrap_or_else(|_| U256::from(0)),
                         U256::from(100),
                     ),
                 };
@@ -856,8 +863,19 @@ impl<B: Backend> State<B> {
                     if let Err(err) = self.sub_balance(&sender, &tx_fee_value) {
                         error!("Sub balance from error transaction sender failed, tx_fee_value={}, error={:?}", tx_fee_value, err);
                     }
-                    self.add_balance(&env_info.author, &tx_fee_value)
-                        .expect("Add balance to author(miner) must success");
+
+                    if check_options.fee_back_platform {
+                        if chain_owner == Address::from(0) {
+                            self.add_balance(&env_info.author, &tx_fee_value)
+                                .expect("Add balance to author(miner) must success");
+                        } else {
+                            self.add_balance(&chain_owner, &tx_fee_value)
+                                .expect("Add balance to chain owner must success");
+                        }
+                    } else {
+                        self.add_balance(&env_info.author, &tx_fee_value)
+                            .expect("Add balance to author(miner) must success");
+                    }
                 }
                 let cumulative_gas_used = env_info.gas_used + tx_gas_used;
                 let receipt = Receipt::new(
@@ -869,7 +887,7 @@ impl<B: Backend> State<B> {
                     t.get_transaction_hash(),
                 );
                 Ok(ApplyOutcome {
-                    receipt: receipt,
+                    receipt,
                     trace: Vec::new(),
                 })
             }
@@ -895,7 +913,9 @@ impl<B: Backend> State<B> {
                         .factories
                         .accountdb
                         .create(self.db.as_hashdb_mut(), addr_hash);
-                    account.commit_storage(&self.factories.trie, account_db.as_hashdb_mut())?;
+                    account
+                        .commit_storage(&self.factories.trie, account_db.as_hashdb_mut())
+                        .map_err(|err| *err)?;
 
                     account.commit_code(account_db.as_hashdb_mut());
                     account.commit_abi(account_db.as_hashdb_mut())
@@ -910,15 +930,16 @@ impl<B: Backend> State<B> {
             let mut trie = self
                 .factories
                 .trie
-                .from_existing(self.db.as_hashdb_mut(), &mut self.root)?;
+                .from_existing(self.db.as_hashdb_mut(), &mut self.root)
+                .map_err(|err| *err)?;
             for (address, ref mut a) in accounts.iter_mut().filter(|&(_, ref a)| a.is_dirty()) {
                 a.state = AccountState::Committed;
                 match a.account {
                     Some(ref mut account) => {
-                        trie.insert(address, &account.rlp())?;
+                        trie.insert(address, &account.rlp()).map_err(|err| *err)?;
                     }
                     None => {
-                        trie.remove(address)?;
+                        trie.remove(address).map_err(|err| *err)?;
                     }
                 }
             }
@@ -957,7 +978,7 @@ impl<B: Backend> State<B> {
                 .borrow()
                 .iter()
                 .filter_map(|(address, ref entry)| {
-                    if touched.contains(address)  // Check all touched accounts
+                    let should_kill = touched.contains(address)  // Check all touched accounts
                         && ((remove_empty_touched && entry.exists_and_is_null()) // Remove all empty touched accounts.
                             || min_balance.map_or(false, |ref balance| {
                                 entry.account.as_ref().map_or(false, |account| {
@@ -967,8 +988,9 @@ impl<B: Backend> State<B> {
                                         && account.balance() < balance
                                         && entry.old_balance.as_ref().map_or(false, |b| account.balance() < b)
                                 })
-                            })) {
-                        Some(address.clone())
+                            }));
+                    if should_kill {
+                        Some(*address)
                     } else {
                         None
                     }
@@ -1124,7 +1146,7 @@ impl<B: Backend> State<B> {
         let contains_key = self.cache.borrow().contains_key(a);
         if !contains_key {
             match self.db.get_cached_account(a) {
-                Some(acc) => self.insert_cache(a, AccountEntry::new_clean_cached(acc)),
+                Some(acc) => self.insert_cache(a, AccountEntry::new_clean_cached(Some(acc))),
                 None => {
                     let maybe_acc = if !self.db.is_known_null(a) {
                         let db = self
@@ -1219,7 +1241,7 @@ impl Clone for State<StateDB> {
             factories: self.factories.clone(),
             account_permissions: self.account_permissions.clone(),
             group_accounts: self.group_accounts.clone(),
-            super_admin_account: self.super_admin_account.clone(),
+            super_admin_account: self.super_admin_account,
         }
     }
 }
@@ -1312,15 +1334,23 @@ mod tests {
         let engine = NullEngine::cita();
 
         println!("contract_address {:?}", contract_address);
+
+        let check_options = CheckOptions {
+            permission: false,
+            quota: false,
+            fee_back_platform: false,
+            send_tx_permission: false,
+            create_contract_permission: false,
+        };
         let result = state
             .apply(
                 &info,
                 &engine,
                 &signed,
                 true,
-                false,
-                false,
                 Default::default(),
+                Address::from(0),
+                &check_options,
             )
             .unwrap();
         println!(
@@ -2487,6 +2517,8 @@ mod tests {
         let expected = "530acecc6ec873396bb3e90b6578161f9688ed7eeeb93d6fba5684895a93b78a";
         #[cfg(feature = "blake2bhash")]
         let expected = "da6a27e8063dd144a208f56f6b8dd6b3536ce6adbea93a1bcba95ce7fedb802c";
+        #[cfg(feature = "sm3hash")]
+        let expected = "63b984566f02930a2a959cef805ab0b17f68653a1430a2422e62f21a9f878cde";
 
         assert_eq!(state.root().lower_hex(), expected);
     }
@@ -2532,6 +2564,8 @@ mod tests {
         let expected = "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
         #[cfg(feature = "blake2bhash")]
         let expected = "c14af59107ef14003e4697a40ea912d865eb1463086a4649977c13ea69b0d9af";
+        #[cfg(feature = "sm3hash")]
+        let expected = "995b949869f80fa1465a9d8b6fa759ec65c3020d59c2624662bdff059bdf19b3";
 
         assert_eq!(state.root().lower_hex(), expected);
     }

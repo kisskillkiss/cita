@@ -18,8 +18,17 @@
 
 use builtin::Builtin;
 use cita_types::{Address, H160, H256, U256, U512};
-use contracts::permission_management::contains_resource;
-use contracts::Resource;
+use contracts::{
+    grpc::{
+        self,
+        contract::{
+            create_grpc_contract, invoke_grpc_contract, is_create_grpc_address, is_grpc_contract,
+        },
+        grpc_vm::extract_logs_from_response, service_registry,
+    },
+    native::factory::{Contract as NativeContract, Factory as NativeFactory},
+    solc::{permission_management::contains_resource, Resource},
+};
 use crossbeam;
 use engines::Engine;
 use error::ExecutionError;
@@ -29,15 +38,7 @@ use evm::env_info::EnvInfo;
 use evm::{self, Factory, FinalizationResult, Finalize, ReturnData, Schedule};
 pub use executed::{Executed, ExecutionResult};
 use externalities::*;
-use grpc_contracts;
-use grpc_contracts::contract::{
-    create_grpc_contract, invoke_grpc_contract, is_create_grpc_address, is_grpc_contract,
-};
-use grpc_contracts::grpc_vm::extract_logs_from_response;
-use grpc_contracts::service_registry;
 use libexecutor::executor::EconomicalModel;
-use native::factory::Contract as NativeContract;
-use native::factory::Factory as NativeFactory;
 use state::backend::Backend as StateBackend;
 use state::{State, Substate};
 use std::cmp;
@@ -77,6 +78,8 @@ const AMEND_CODE: u32 = 2;
 const AMEND_KV_H256: u32 = 3;
 ///amend get the value of db
 const AMEND_GET_KV_H256: u32 = 4;
+///amend account's balance
+const AMEND_ACCOUNT_BALANCE: u32 = 5;
 
 // minimum required gas, just for check
 const MIN_GAS_REQUIRED: u32 = 100;
@@ -92,51 +95,60 @@ pub fn contract_address(address: &Address, nonce: &U256) -> Address {
 }
 
 /// Check the sender's permission
+#[allow(unknown_lints, implicit_hasher)] // TODO clippy
 pub fn check_permission(
     group_accounts: &HashMap<Address, Vec<Address>>,
     account_permissions: &HashMap<Address, Vec<Resource>>,
     t: &SignedTransaction,
+    options: &TransactOptions,
 ) -> Result<(), ExecutionError> {
     let sender = *t.sender();
-    check_send_tx(group_accounts, account_permissions, &sender)?;
+
+    if options.check_send_tx_permission {
+        check_send_tx(group_accounts, account_permissions, &sender)?;
+    }
 
     match t.action {
         Action::Create => {
-            check_create_contract(group_accounts, account_permissions, &sender)?;
+            if options.check_create_contract_permission {
+                check_create_contract(group_accounts, account_permissions, &sender)?;
+            }
         }
         Action::Call(address) => {
-            let group_management_addr =
-                Address::from_str(reserved_addresses::GROUP_MANAGEMENT).unwrap();
-            trace!("t.data {:?}", t.data);
+            if options.check_permission {
+                let group_management_addr =
+                    Address::from_str(reserved_addresses::GROUP_MANAGEMENT).unwrap();
+                trace!("t.data {:?}", t.data);
 
-            if t.data.len() < 4 {
-                return Err(ExecutionError::TransactionMalformed(
-                    "The length of transation data is less than four bytes".to_string(),
-                ));
-            }
-
-            if address == group_management_addr {
-                if t.data.len() < 36 {
+                if t.data.len() < 4 {
                     return Err(ExecutionError::TransactionMalformed(
-                        "Data should have at least one parameter".to_string(),
+                        "The length of transation data is less than four bytes".to_string(),
                     ));
                 }
-                check_origin_group(
+
+                if address == group_management_addr {
+                    if t.data.len() < 36 {
+                        return Err(ExecutionError::TransactionMalformed(
+                            "Data should have at least one parameter".to_string(),
+                        ));
+                    }
+                    check_origin_group(
+                        account_permissions,
+                        &sender,
+                        &address,
+                        &t.data[0..4],
+                        &H160::from(&t.data[16..36]),
+                    )?;
+                }
+
+                check_call_contract(
+                    group_accounts,
                     account_permissions,
                     &sender,
                     &address,
-                    t.data[0..4].to_vec(),
-                    &H160::from(&t.data[16..36]),
+                    &t.data[0..4],
                 )?;
             }
-
-            check_call_contract(
-                group_accounts,
-                account_permissions,
-                &sender,
-                &address,
-                t.data[0..4].to_vec(),
-            )?;
         }
         _ => {}
     }
@@ -152,7 +164,13 @@ fn check_send_tx(
 ) -> Result<(), ExecutionError> {
     let cont = Address::from_str(reserved_addresses::PERMISSION_SEND_TX).unwrap();
     let func = vec![0; 4];
-    let has_permission = has_resource(group_accounts, account_permissions, account, &cont, func);
+    let has_permission = has_resource(
+        group_accounts,
+        account_permissions,
+        account,
+        &cont,
+        &func[..],
+    );
 
     trace!("has send tx permission: {:?}", has_permission);
 
@@ -171,7 +189,13 @@ fn check_create_contract(
 ) -> Result<(), ExecutionError> {
     let cont = Address::from_str(reserved_addresses::PERMISSION_CREATE_CONTRACT).unwrap();
     let func = vec![0; 4];
-    let has_permission = has_resource(group_accounts, account_permissions, account, &cont, func);
+    let has_permission = has_resource(
+        group_accounts,
+        account_permissions,
+        account,
+        &cont,
+        &func[..],
+    );
 
     trace!("has create contract permission: {:?}", has_permission);
 
@@ -188,7 +212,7 @@ fn check_call_contract(
     account_permissions: &HashMap<Address, Vec<Resource>>,
     account: &Address,
     cont: &Address,
-    func: Vec<u8>,
+    func: &[u8],
 ) -> Result<(), ExecutionError> {
     let has_permission = has_resource(group_accounts, account_permissions, account, cont, func);
 
@@ -206,14 +230,14 @@ fn check_origin_group(
     account_permissions: &HashMap<Address, Vec<Resource>>,
     account: &Address,
     cont: &Address,
-    func: Vec<u8>,
+    func: &[u8],
     param: &Address,
 ) -> Result<(), ExecutionError> {
-    let has_permission = contains_resource(account_permissions, account, *cont, func.clone());
+    let has_permission = contains_resource(account_permissions, account, *cont, func);
 
     trace!("Sender has call contract permission: {:?}", has_permission);
 
-    if !has_permission && !contains_resource(account_permissions, param, *cont, func.clone()) {
+    if !has_permission && !contains_resource(account_permissions, param, *cont, func) {
         return Err(ExecutionError::NoCallPermission);
     }
 
@@ -228,13 +252,13 @@ fn has_resource(
     account_permissions: &HashMap<Address, Vec<Resource>>,
     account: &Address,
     cont: &Address,
-    func: Vec<u8>,
+    func: &[u8],
 ) -> bool {
     let groups = get_groups(group_accounts, account);
 
-    if !contains_resource(account_permissions, account, *cont, func.clone()) {
+    if !contains_resource(account_permissions, account, *cont, func) {
         for group in groups {
-            if contains_resource(account_permissions, &group, *cont, func.clone()) {
+            if contains_resource(account_permissions, &group, *cont, func) {
                 return true;
             }
         }
@@ -296,6 +320,10 @@ pub struct TransactOptions {
     pub check_permission: bool,
     /// Check account gas limit
     pub check_quota: bool,
+    /// Check sender's send_tx permission
+    pub check_send_tx_permission: bool,
+    /// Check sender's create_contract permission
+    pub check_create_contract_permission: bool,
 }
 
 /// Transaction executor.
@@ -309,10 +337,13 @@ pub struct Executive<'a, B: 'a + StateBackend> {
     native_factory: &'a NativeFactory,
     /// Check EconomicalModel
     economical_model: EconomicalModel,
+    check_fee_back_platform: bool,
+    chain_owner: Address,
 }
 
 impl<'a, B: 'a + StateBackend> Executive<'a, B> {
     /// Basic constructor.
+    #[allow(unknown_lints, too_many_arguments)] // TODO clippy
     pub fn new(
         state: &'a mut State<B>,
         info: &'a EnvInfo,
@@ -321,16 +352,20 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         native_factory: &'a NativeFactory,
         static_flag: bool,
         economical_model: EconomicalModel,
+        check_fee_back_platform: bool,
+        chain_owner: Address,
     ) -> Self {
         Executive {
-            state: state,
-            info: info,
-            engine: engine,
-            vm_factory: vm_factory,
-            native_factory: native_factory,
+            state,
+            info,
+            engine,
+            vm_factory,
+            native_factory,
             depth: 0,
-            static_flag: static_flag,
-            economical_model: economical_model,
+            static_flag,
+            economical_model,
+            check_fee_back_platform,
+            chain_owner,
         }
     }
 
@@ -339,6 +374,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
     }
 
     /// Populates executive from parent properties. Increments executive depth.
+    #[allow(unknown_lints, too_many_arguments)] // TODO clippy
     pub fn from_parent(
         state: &'a mut State<B>,
         info: &'a EnvInfo,
@@ -348,20 +384,25 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         parent_depth: usize,
         static_flag: bool,
         economical_model: EconomicalModel,
+        check_fee_back_platform: bool,
+        chain_owner: Address,
     ) -> Self {
         Executive {
-            state: state,
-            info: info,
-            engine: engine,
-            vm_factory: vm_factory,
-            native_factory: native_factory,
+            state,
+            info,
+            engine,
+            vm_factory,
+            native_factory,
             depth: parent_depth + 1,
-            static_flag: static_flag,
-            economical_model: economical_model,
+            static_flag,
+            economical_model,
+            check_fee_back_platform,
+            chain_owner,
         }
     }
 
     /// Creates `Externalities` from `Executive`.
+    #[allow(unknown_lints, too_many_arguments)] // TODO clippy
     pub fn as_externalities<'any, T, V>(
         &'any mut self,
         origin_info: OriginInfo,
@@ -371,6 +412,8 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         vm_tracer: &'any mut V,
         static_call: bool,
         economical_model: EconomicalModel,
+        check_fee_back_platform: bool,
+        chain_owner: Address,
     ) -> Externalities<'any, T, V, B>
     where
         T: Tracer,
@@ -391,6 +434,8 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
             vm_tracer,
             is_static,
             economical_model,
+            check_fee_back_platform,
+            chain_owner,
         )
     }
 
@@ -398,7 +443,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
     pub fn transact(
         &'a mut self,
         t: &SignedTransaction,
-        options: TransactOptions,
+        options: &TransactOptions,
     ) -> Result<Executed, ExecutionError> {
         match (options.tracing, options.vm_tracing) {
             (true, true) => self.transact_with_tracer(
@@ -433,11 +478,43 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         self.state.reset_code(&account, code.to_vec()).is_ok()
     }
 
-    fn transact_set_kv_h256(&mut self, data: &[u8]) -> bool {
+    fn transact_set_balance(&mut self, data: &[u8]) -> bool {
+        if data.len() < 52 {
+            return false;
+        }
         let account = H160::from(&data[0..20]);
-        let key = H256::from_slice(&data[20..52]);
-        let val = H256::from_slice(&data[52..84]);
-        self.state.set_storage(&account, key, val).is_ok()
+        let balance = U256::from(&data[20..52]);
+        self.state
+            .balance(&account)
+            .and_then(|now_val| {
+                if now_val >= balance {
+                    self.state.sub_balance(&account, &(now_val - balance))
+                } else {
+                    self.state.add_balance(&account, &(balance - now_val))
+                }
+            })
+            .is_ok()
+    }
+
+    fn transact_set_kv_h256(&mut self, data: &[u8]) -> bool {
+        let len = data.len();
+        if len < 84 {
+            return false;
+        }
+        let loop_num: usize = (len - 20) / (32 * 2);
+        let account = H160::from(&data[0..20]);
+
+        self.state.checkpoint();
+        for i in 0..loop_num {
+            let base = 20 + 32 * 2 * i;
+            let key = H256::from_slice(&data[base..base + 32]);
+            let val = H256::from_slice(&data[base + 32..base + 32 * 2]);
+            if self.state.set_storage(&account, key, val).is_err() {
+                self.state.discard_checkpoint();
+                return false;
+            }
+        }
+        true
     }
 
     fn transact_get_kv_h256(&mut self, data: &[u8]) -> Option<H256> {
@@ -449,7 +526,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
     pub fn transact_with_tracer<T, V>(
         &'a mut self,
         t: &SignedTransaction,
-        options: TransactOptions,
+        options: &TransactOptions,
         mut tracer: T,
         mut vm_tracer: V,
     ) -> Result<Executed, ExecutionError>
@@ -463,13 +540,13 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         self.state.inc_nonce(&sender)?;
 
         trace!("permission should be check: {}", options.check_permission);
-        if options.check_permission {
-            check_permission(
-                &self.state.group_accounts,
-                &self.state.account_permissions,
-                t,
-            )?;
-        }
+
+        check_permission(
+            &self.state.group_accounts,
+            &self.state.account_permissions,
+            t,
+            options,
+        )?;
 
         if sender != Address::zero() && t.gas < U256::from(MIN_GAS_REQUIRED) {
             return Err(ExecutionError::NotEnoughBaseGas {
@@ -498,52 +575,10 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
             )?;
         }*/
 
-        let mut need_output: Vec<u8> = vec![];
-        if t.action == Action::AbiStore {
-            if !self.transact_set_abi(&t.data) {
-                return Err(ExecutionError::TransactionMalformed(
-                    "Account doesn't exist".to_string(),
-                ));
-            }
-        } else if t.action == Action::AmendData {
-            let atype = t.value.low_u32();
-            match atype {
-                AMEND_ABI => {
-                    if !self.transact_set_abi(&t.data) {
-                        return Err(ExecutionError::TransactionMalformed(
-                            "Account doesn't exist".to_string(),
-                        ));
-                    }
-                }
-                AMEND_CODE => {
-                    if !self.transact_set_code(&t.data) {
-                        return Err(ExecutionError::TransactionMalformed(
-                            "Account doesn't exist".to_string(),
-                        ));
-                    }
-                }
-                AMEND_KV_H256 => {
-                    if !self.transact_set_kv_h256(&t.data) {
-                        return Err(ExecutionError::TransactionMalformed(
-                            "Account doesn't exist".to_string(),
-                        ));
-                    }
-                }
-                AMEND_GET_KV_H256 => {
-                    if let Some(v) = self.transact_get_kv_h256(&t.data) {
-                        need_output = v.to_vec();
-                    } else {
-                        return Err(ExecutionError::TransactionMalformed(
-                            "May be incomplete trie error".to_string(),
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(ExecutionError::TransactionMalformed(
-                        "amend type if error".to_string(),
-                    ));
-                }
-            }
+        if t.action == Action::AbiStore && !self.transact_set_abi(&t.data) {
+            return Err(ExecutionError::TransactionMalformed(
+                "Account doesn't exist".to_owned(),
+            ));
         }
 
         // NOTE: there can be no invalid transactions from this point
@@ -590,8 +625,8 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                 let address = Address::default();
                 let params = ActionParams {
                     code_address: address,
-                    address: address,
-                    sender: sender,
+                    address,
+                    sender,
                     origin: sender,
                     gas: init_gas,
                     gas_price: t.gas_price(),
@@ -604,33 +639,17 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                 trace!(target: "executive", "call: {:?}", params);
                 let mut out = vec![];
                 (
-                    self.call_grpc_contract(params, &mut substate, BytesRef::Flexible(&mut out)),
+                    self.call_grpc_contract(&params, &mut substate, &BytesRef::Flexible(&mut out)),
                     out,
                 )
             }
-            Action::AmendData => (
-                Ok(FinalizationResult {
-                    // Super admin operations do not cost gas
-                    gas_left: t.gas,
-                    return_data: {
-                        if need_output.is_empty() {
-                            ReturnData::empty()
-                        } else {
-                            let len = need_output.len();
-                            ReturnData::new(need_output, 0, len)
-                        }
-                    },
-                    apply_state: true,
-                }),
-                vec![],
-            ),
             Action::Create => {
                 let new_address = contract_address(&sender, &nonce);
                 let params = ActionParams {
                     code_address: new_address,
                     code_hash: t.data.crypt_hash(),
                     address: new_address,
-                    sender: sender,
+                    sender,
                     origin: sender,
                     gas: init_gas,
                     gas_price: t.gas_price(),
@@ -640,15 +659,43 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                     call_type: CallType::None,
                 };
                 (
-                    self.create(params, &mut substate, &mut tracer, &mut vm_tracer),
+                    self.create(&params, &mut substate, &mut tracer, &mut vm_tracer),
                     vec![],
+                )
+            }
+            Action::AmendData => {
+                let amend_data_address: Address = reserved_addresses::AMEND_ADDRESS.into();
+                let params = ActionParams {
+                    code_address: amend_data_address,
+                    address: amend_data_address,
+                    sender,
+                    origin: sender,
+                    gas: init_gas,
+                    gas_price: t.gas_price(),
+                    value: ActionValue::Apparent(t.value),
+                    code: None,
+                    code_hash: HASH_EMPTY,
+                    data: Some(t.data.clone()),
+                    call_type: CallType::Call,
+                };
+                trace!(target: "executive", "amend data: {:?}", params);
+                let mut out = vec![];
+                (
+                    self.call(
+                        &params,
+                        &mut substate,
+                        BytesRef::Flexible(&mut out),
+                        &mut tracer,
+                        &mut vm_tracer,
+                    ),
+                    out,
                 )
             }
             Action::Call(ref address) => {
                 let params = ActionParams {
                     code_address: *address,
                     address: *address,
-                    sender: sender,
+                    sender,
                     origin: sender,
                     gas: init_gas,
                     gas_price: t.gas_price(),
@@ -662,7 +709,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                 let mut out = vec![];
                 (
                     self.call(
-                        params,
+                        &params,
                         &mut substate,
                         BytesRef::Flexible(&mut out),
                         &mut tracer,
@@ -687,7 +734,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 
     fn exec_vm<T, V>(
         &mut self,
-        params: ActionParams,
+        params: &ActionParams,
         unconfirmed_substate: &mut Substate,
         output_policy: OutputPolicy,
         tracer: &mut T,
@@ -704,14 +751,18 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         if (self.depth + 1) % depth_threshold != 0 {
             let vm_factory = self.vm_factory;
             let economical_model = self.economical_model;
+            let check_fee_back_platform = self.check_fee_back_platform;
+            let chain_owner = self.chain_owner;
             let mut ext = self.as_externalities(
-                OriginInfo::from(&params),
+                OriginInfo::from(params),
                 unconfirmed_substate,
                 output_policy,
                 tracer,
                 vm_tracer,
                 static_call,
                 economical_model,
+                check_fee_back_platform,
+                chain_owner,
             );
             return vm_factory
                 .create(params.gas)
@@ -725,14 +776,18 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         crossbeam::scope(|scope| {
             let vm_factory = self.vm_factory;
             let economical_model = self.economical_model;
+            let check_fee_back_platform = self.check_fee_back_platform;
+            let chain_owner = self.chain_owner;
             let mut ext = self.as_externalities(
-                OriginInfo::from(&params),
+                OriginInfo::from(params),
                 unconfirmed_substate,
                 output_policy,
                 tracer,
                 vm_tracer,
                 static_call,
                 economical_model,
+                check_fee_back_platform,
+                chain_owner,
             );
 
             scope.spawn(move || {
@@ -750,7 +805,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
     /// Returns either gas_left or `evm::Error`.
     pub fn call<T, V>(
         &mut self,
-        params: ActionParams,
+        params: &ActionParams,
         substate: &mut Substate,
         output: BytesRef,
         tracer: &mut T,
@@ -788,10 +843,12 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                 static_call,
                 native_contract,
             )
+        } else if self.is_amend_data_address(params.code_address) {
+            self.call_amend_data(params, substate, &output)
         } else if is_create_grpc_address(params.code_address)
             || is_grpc_contract(params.code_address)
         {
-            self.call_grpc_contract(params, substate, output)
+            self.call_grpc_contract(params, substate, &output)
         } else if let Some(builtin) = self.engine.builtin(&params.code_address, self.info.number) {
             // check and call Builtin contract
             self.call_builtin_contract(params, output, tracer, builtin)
@@ -801,11 +858,81 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         }
     }
 
+    fn is_amend_data_address(&self, address: Address) -> bool {
+        let amend_address: Address = reserved_addresses::AMEND_ADDRESS.into();
+        amend_address == address
+    }
+
+    fn call_amend_data(
+        &mut self,
+        params: &ActionParams,
+        _substate: &mut Substate,
+        _output: &BytesRef,
+    ) -> evm::Result<FinalizationResult> {
+        // Must send from admin address
+        if Some(params.origin) != self.state.super_admin_account {
+            return Err(evm::error::Error::Internal("no permission".to_owned()));
+        }
+        let atype = params.value.value().low_u32();
+        let mut result = FinalizationResult {
+            gas_left: params.gas,
+            apply_state: true,
+            return_data: ReturnData::empty(),
+        };
+        match atype {
+            AMEND_ABI => if self.transact_set_abi(&(params.data.to_owned().unwrap())) {
+                Ok(result)
+            } else {
+                Err(evm::error::Error::Internal(
+                    "Account doesn't exist".to_owned(),
+                ))
+            },
+            AMEND_CODE => if self.transact_set_code(&(params.data.to_owned().unwrap())) {
+                Ok(result)
+            } else {
+                Err(evm::error::Error::Internal(
+                    "Account doesn't exist".to_owned(),
+                ))
+            },
+            AMEND_KV_H256 => if self.transact_set_kv_h256(&(params.data.to_owned().unwrap())) {
+                Ok(result)
+            } else {
+                Err(evm::error::Error::Internal(
+                    "Account doesn't exist".to_owned(),
+                ))
+            },
+            AMEND_GET_KV_H256 => {
+                if let Some(v) = self.transact_get_kv_h256(&(params.data.to_owned().unwrap())) {
+                    let data = v.to_vec();
+                    let size = data.len();
+                    result.return_data = ReturnData::new(data, 0, size);
+                    Ok(result)
+                } else {
+                    Err(evm::error::Error::Internal(
+                        "May be incomplete trie error".to_owned(),
+                    ))
+                }
+            }
+
+            AMEND_ACCOUNT_BALANCE => {
+                if self.transact_set_balance(&(params.data.to_owned().unwrap())) {
+                    Ok(result)
+                } else {
+                    Err(evm::error::Error::Internal(
+                        "Account doesn't exist or incomplete trie error".to_owned(),
+                    ))
+                }
+            }
+
+            _ => Ok(result),
+        }
+    }
+
     fn call_grpc_contract(
         &mut self,
-        params: ActionParams,
+        params: &ActionParams,
         substate: &mut Substate,
-        _output: BytesRef,
+        _output: &BytesRef,
     ) -> evm::Result<FinalizationResult> {
         let is_create = is_create_grpc_address(params.code_address);
         let address = if is_create {
@@ -821,7 +948,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
             params.code_address
         };
 
-        let connect_info = match service_registry::find_contract(address, true) {
+        let connect_info = match service_registry::find_contract(address, !is_create) {
             Some(contract_state) => contract_state.conn_info,
             None => {
                 return Err(evm::error::Error::Internal(format!(
@@ -830,49 +957,33 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                 )));
             }
         };
+
         let response = if is_create {
-            create_grpc_contract(
-                self.info,
-                params.clone(),
-                self.state,
-                true,
-                true,
-                connect_info,
-            )
+            service_registry::enable_contract(address);
+            create_grpc_contract(self.info, &params, self.state, true, true, &connect_info)
         } else {
-            invoke_grpc_contract(
-                self.info,
-                params.clone(),
-                self.state,
-                true,
-                true,
-                connect_info,
-            )
+            invoke_grpc_contract(self.info, &params, self.state, true, true, &connect_info)
         };
         match response {
             Ok(invoke_response) => {
                 // store grpc return storages to stateDB
-                for storage in invoke_response.get_storages().into_iter() {
+                for storage in &invoke_response.get_storages()[..] {
                     let key = storage.get_key();
                     let value = storage.get_value();
                     trace!("recv resp: {:?}", storage);
                     trace!("key: {:?}, value: {:?}", key, value);
-                    grpc_contracts::storage::set_storage(
-                        self.state,
-                        params.address,
-                        key.to_vec(),
-                        value.to_vec(),
-                    ).unwrap();
+                    grpc::storage::set_storage(self.state, params.address, key, value).unwrap();
                 }
 
                 // update contract_state.height
                 service_registry::set_enable_contract_height(params.address, self.info.number);
                 substate.logs = extract_logs_from_response(params.address, &invoke_response);
+                let message = invoke_response.get_message();
 
                 Ok(FinalizationResult {
                     gas_left: U256::from_str(invoke_response.get_gas_left()).unwrap(),
                     apply_state: true,
-                    return_data: ReturnData::empty(),
+                    return_data: ReturnData::new(message.as_bytes().to_vec(), 0, message.len()),
                 })
             }
             Err(e) => Err(evm::error::Error::Internal(e.description().to_string())),
@@ -881,7 +992,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 
     fn call_evm_contract<T, V>(
         &mut self,
-        params: ActionParams,
+        params: &ActionParams,
         substate: &mut Substate,
         output: BytesRef,
         tracer: &mut T,
@@ -891,7 +1002,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         T: Tracer,
         V: VMTracer,
     {
-        let trace_info = tracer.prepare_trace_call(&params);
+        let trace_info = tracer.prepare_trace_call(params);
         let mut trace_output = tracer.prepare_trace_output();
         let mut subtracer = tracer.subtracer();
         let gas = params.gas;
@@ -950,7 +1061,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 
     fn call_builtin_contract<T>(
         &mut self,
-        params: ActionParams,
+        params: &ActionParams,
         mut output: BytesRef,
         tracer: &mut T,
         builtin: &Builtin,
@@ -971,7 +1082,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         } else {
             &default as &[u8]
         };
-        let trace_info = tracer.prepare_trace_call(&params);
+        let trace_info = tracer.prepare_trace_call(params);
         let cost = builtin.cost(data);
         if cost <= params.gas {
             builtin.execute(data, &mut output);
@@ -1003,7 +1114,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 
     fn call_native_contract<T>(
         &mut self,
-        params: ActionParams,
+        params: &ActionParams,
         substate: &mut Substate,
         output: BytesRef,
         tracer: &mut T,
@@ -1020,6 +1131,8 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
             let mut tracer = NoopTracer;
             let mut vmtracer = NoopVMTracer;
             let economical_model = self.economical_model;
+            let check_fee_back_platform = self.check_fee_back_platform;
+            let chain_owner = self.chain_owner;
             let mut ext = self.as_externalities(
                 OriginInfo::from(&params),
                 &mut unconfirmed_substate,
@@ -1028,12 +1141,14 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                 &mut vmtracer,
                 static_call,
                 economical_model,
+                check_fee_back_platform,
+                chain_owner,
             );
-            contract.exec(params, &mut ext).finalize(ext)
+            contract.exec(&params, &mut ext).finalize(ext)
         };
         self.enact_result(&res, substate, unconfirmed_substate);
         trace!(target: "executive", "enacted: substate={:?}\n", substate);
-        return res;
+        res
     }
 
     /// Creates contract with given contract params.
@@ -1041,7 +1156,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
     /// Modifies the substate.
     pub fn create<T, V>(
         &mut self,
-        params: ActionParams,
+        params: &ActionParams,
         substate: &mut Substate,
         tracer: &mut T,
         vm_tracer: &mut V,
@@ -1102,7 +1217,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 
         let res = {
             self.exec_vm(
-                params,
+                &params,
                 &mut unconfirmed_substate,
                 OutputPolicy::InitContract(trace_output.as_mut()),
                 &mut subtracer,
@@ -1128,6 +1243,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
     }
 
     /// Finalizes the transaction (does refunds and suicides).
+    #[allow(unknown_lints, too_many_arguments)] // TODO clippy
     fn finalize(
         &mut self,
         t: &SignedTransaction,
@@ -1194,7 +1310,22 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
         );
 
         if let EconomicalModel::Charge = self.economical_model {
-            self.state.add_balance(&self.info.author, &fees_value)?;
+            if self.check_fee_back_platform {
+                // check_fee_back_platform is true, but chain_owner not set, fee still back to author(miner)
+                if self.chain_owner == Address::from(0) {
+                    self.state
+                        .add_balance(&self.info.author, &fees_value)
+                        .expect("Add balance to author(miner) must success");
+                } else {
+                    self.state
+                        .add_balance(&self.chain_owner, &fees_value)
+                        .expect("Add balance to chain owner must success");
+                }
+            } else {
+                self.state
+                    .add_balance(&self.info.author, &fees_value)
+                    .expect("Add balance to author(miner) must success");
+            }
         }
 
         // perform suicides
@@ -1220,11 +1351,11 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                 cumulative_gas_used: self.info.gas_used + t.gas,
                 logs: vec![],
                 contracts_created: vec![],
-                output: output,
-                trace: trace,
-                vm_trace: vm_trace,
+                output,
+                trace,
+                vm_trace,
                 state_diff: None,
-                account_nonce: account_nonce,
+                account_nonce,
             }),
             Ok(r) => Ok(Executed {
                 exception: if r.apply_state {
@@ -1233,16 +1364,16 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
                     Some(evm::Error::Reverted)
                 },
                 gas: t.gas,
-                gas_used: gas_used,
-                refunded: refunded,
+                gas_used,
+                refunded,
                 cumulative_gas_used: self.info.gas_used + gas_used,
                 logs: substate.logs,
                 contracts_created: substate.contracts_created,
-                output: output,
-                trace: trace,
-                vm_trace: vm_trace,
+                output,
+                trace,
+                vm_trace,
                 state_diff: None,
-                account_nonce: account_nonce,
+                account_nonce,
             }),
         }
     }
@@ -1334,14 +1465,18 @@ mod tests {
                 &native_factory,
                 false,
                 EconomicalModel::Charge,
+                false,
+                Address::from(0),
             );
             let opts = TransactOptions {
                 tracing: false,
                 vm_tracing: false,
                 check_permission: false,
                 check_quota: true,
+                check_send_tx_permission: false,
+                check_create_contract_permission: false,
             };
-            ex.transact(&t, opts)
+            ex.transact(&t, &opts)
         };
 
         let expected = {
@@ -1393,14 +1528,18 @@ mod tests {
                 &native_factory,
                 false,
                 EconomicalModel::Charge,
+                false,
+                Address::from(0),
             );
             let opts = TransactOptions {
                 tracing: false,
                 vm_tracing: false,
                 check_permission: false,
                 check_quota: true,
+                check_send_tx_permission: false,
+                check_create_contract_permission: false,
             };
-            ex.transact(&t, opts).unwrap()
+            ex.transact(&t, &opts).unwrap()
         };
 
         assert_eq!(executed.gas, U256::from(100_000));
@@ -1449,14 +1588,18 @@ mod tests {
                 &native_factory,
                 false,
                 EconomicalModel::Charge,
+                false,
+                Address::from(0),
             );
             let opts = TransactOptions {
                 tracing: false,
                 vm_tracing: false,
                 check_permission: false,
                 check_quota: true,
+                check_send_tx_permission: false,
+                check_create_contract_permission: false,
             };
-            ex.transact(&t, opts)
+            ex.transact(&t, &opts)
         };
 
         match result {
@@ -1500,14 +1643,18 @@ mod tests {
                 &native_factory,
                 false,
                 EconomicalModel::Quota,
+                false,
+                Address::from(0),
             );
             let opts = TransactOptions {
                 tracing: false,
                 vm_tracing: false,
                 check_permission: false,
                 check_quota: true,
+                check_send_tx_permission: false,
+                check_create_contract_permission: false,
             };
-            ex.transact(&t, opts)
+            ex.transact(&t, &opts)
         };
 
         assert!(result.is_ok());
@@ -1559,8 +1706,10 @@ contract HelloWorld {
             &native_factory,
             false,
             EconomicalModel::Quota,
+            false,
+            Address::from(0),
         );
-        let res = ex.create(params.clone(), &mut substate, &mut tracer, &mut vm_tracer);
+        let res = ex.create(&params, &mut substate, &mut tracer, &mut vm_tracer);
         assert!(res.is_err());
         match res {
             Err(e) => assert_eq!(e, evm::Error::OutOfGas),
@@ -1613,8 +1762,10 @@ contract AbiTest {
                 &native_factory,
                 false,
                 EconomicalModel::Quota,
+                false,
+                Address::from(0),
             );
-            let _ = ex.create(params.clone(), &mut substate, &mut tracer, &mut vm_tracer);
+            let _ = ex.create(&params, &mut substate, &mut tracer, &mut vm_tracer);
         }
 
         assert_eq!(
@@ -1674,10 +1825,12 @@ contract AbiTest {
                 &native_factory,
                 false,
                 EconomicalModel::Quota,
+                false,
+                Address::from(0),
             );
             let mut out = vec![];
             let _ = ex.call(
-                params,
+                &params,
                 &mut substate,
                 BytesRef::Fixed(&mut out),
                 &mut tracer,
@@ -1685,9 +1838,9 @@ contract AbiTest {
             );
         };
 
+        // it was supposed that value's address is balance.
         assert_eq!(
             state
-                // it was supposed that value's address is balance.
                 .storage_at(&contract_addr, &H256::from(&U256::from(0)))
                 .unwrap(),
             H256::from(&U256::from(0x12345678))
@@ -1751,10 +1904,12 @@ contract AbiTest {
                 &native_factory,
                 false,
                 EconomicalModel::Quota,
+                false,
+                Address::from(0),
             );
             let mut out = vec![];
             let res = ex.call(
-                params,
+                &params,
                 &mut substate,
                 BytesRef::Fixed(&mut out),
                 &mut tracer,
@@ -1767,9 +1922,9 @@ contract AbiTest {
             }
         };
 
+        // it was supposed that value's address is balance.
         assert_eq!(
             state
-                // it was supposed that value's address is balance.
                 .storage_at(&contract_addr, &H256::from(&U256::from(0)))
                 .unwrap(),
             H256::from(&U256::from(0x0))
@@ -1833,10 +1988,12 @@ contract AbiTest {
                 &native_factory,
                 false,
                 EconomicalModel::Quota,
+                false,
+                Address::from(0),
             );
             let mut out = vec![];
             let res = ex.call(
-                params,
+                &params,
                 &mut substate,
                 BytesRef::Fixed(&mut out),
                 &mut tracer,
@@ -1849,9 +2006,9 @@ contract AbiTest {
             }
         };
 
+        // it was supposed that value's address is balance.
         assert_eq!(
             state
-                // it was supposed that value's address is balance.
                 .storage_at(&contract_addr, &H256::from(&U256::from(0)))
                 .unwrap(),
             H256::from(&U256::from(0x12345678))
@@ -1931,10 +2088,12 @@ contract FakePermissionManagement {
                 &native_factory,
                 false,
                 EconomicalModel::Quota,
+                false,
+                Address::from(0),
             );
             let mut out = vec![];
             let res = ex.call(
-                params,
+                &params,
                 &mut substate,
                 BytesRef::Fixed(&mut out),
                 &mut tracer,

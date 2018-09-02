@@ -22,7 +22,7 @@ use error::Error;
 use evm::env_info::{EnvInfo, LastHashes};
 use factory::Factories;
 use header::*;
-use libexecutor::executor::{EconomicalModel, Executor, GlobalSysConfig};
+use libexecutor::executor::{CheckOptions, EconomicalModel, Executor, GlobalSysConfig};
 use libproto::blockchain::SignedTransaction as ProtoSignedTransaction;
 use libproto::blockchain::{Block as ProtoBlock, BlockBody as ProtoBlockBody};
 use libproto::executor::{ExecutedInfo, ReceiptWithOption};
@@ -88,7 +88,7 @@ impl From<ProtoBlock> for Block {
         let mut header = Header::from(b.get_header().clone());
         header.set_version(b.get_version());
         Block {
-            header: header,
+            header,
             body: BlockBody::from(b.get_body().clone()),
         }
     }
@@ -306,9 +306,9 @@ impl DerefMut for ExecutedBlock {
 impl ExecutedBlock {
     fn new(block: Block, state: State<StateDB>, tracing: bool) -> ExecutedBlock {
         ExecutedBlock {
-            block: block,
+            block,
             receipts: Default::default(),
-            state: state,
+            state,
             current_gas_used: U256::zero(),
             traces: if tracing { Some(Vec::new()) } else { None },
         }
@@ -364,7 +364,7 @@ impl OpenBlock {
 
         let r = OpenBlock {
             exec_block: ExecutedBlock::new(block, state, tracing),
-            last_hashes: last_hashes,
+            last_hashes,
             account_gas_limit: conf.account_gas_limit.common_gas_limit.into(),
             account_gas: conf.account_gas_limit.specific_gas_limit.iter().fold(
                 HashMap::new(),
@@ -382,7 +382,7 @@ impl OpenBlock {
     pub fn env_info(&self) -> EnvInfo {
         EnvInfo {
             number: self.number(),
-            author: self.header.proposer().clone(),
+            author: *self.header.proposer(),
             timestamp: self.timestamp(),
             difficulty: U256::default(),
             last_hashes: Arc::clone(&self.last_hashes),
@@ -397,22 +397,20 @@ impl OpenBlock {
     pub fn apply_transactions(
         &mut self,
         executor: &Executor,
-        check_permission: bool,
-        check_quota: bool,
+        chain_owner: Address,
+        check_options: &CheckOptions,
     ) -> bool {
         for (index, t) in self.body.transactions.clone().into_iter().enumerate() {
-            if index & CHECK_NUM == 0 {
-                if executor.is_interrupted.load(Ordering::SeqCst) {
-                    executor.is_interrupted.store(false, Ordering::SeqCst);
-                    return false;
-                }
+            if index & CHECK_NUM == 0 && executor.is_interrupted.load(Ordering::SeqCst) {
+                executor.is_interrupted.store(false, Ordering::SeqCst);
+                return false;
             }
             self.apply_transaction(
                 &*executor.engine,
                 &t,
-                check_permission,
-                check_quota,
                 *executor.economical_model.read(),
+                chain_owner,
+                check_options,
             );
         }
 
@@ -426,13 +424,14 @@ impl OpenBlock {
         true
     }
 
+    #[allow(unknown_lints, too_many_arguments)] // TODO clippy
     pub fn apply_transaction(
         &mut self,
         engine: &Engine,
         t: &SignedTransaction,
-        check_permission: bool,
-        check_quota: bool,
         economical_model: EconomicalModel,
+        chain_owner: Address,
+        check_options: &CheckOptions,
     ) {
         let mut env_info = self.env_info();
         self.account_gas
@@ -449,9 +448,9 @@ impl OpenBlock {
             engine,
             t,
             has_traces,
-            check_permission,
-            check_quota,
             economical_model,
+            chain_owner,
+            check_options,
         ) {
             Ok(outcome) => {
                 trace!("apply signed transaction {} success", t.hash());
@@ -460,14 +459,14 @@ impl OpenBlock {
                 }
                 let transaction_gas_used = outcome.receipt.gas_used - self.current_gas_used;
                 self.current_gas_used = outcome.receipt.gas_used;
-                if check_quota {
+                if check_options.quota {
                     if let Some(value) = self.account_gas.get_mut(t.sender()) {
                         *value = *value - transaction_gas_used;
                     }
                 }
                 self.receipts.push(outcome.receipt);
             }
-            Err(_) => panic!("apply_transaction: There must be something wrong!"),
+            _ => panic!("apply_transaction: There must be something wrong!"),
         }
     }
 

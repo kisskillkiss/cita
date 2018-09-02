@@ -1,5 +1,5 @@
 use cita_types::{Address, H256};
-use core::contracts::sys_config::SysConfig;
+use core::contracts::solc::sys_config::SysConfig;
 use core::db;
 use core::libexecutor::block::{Block, ClosedBlock};
 use core::libexecutor::call_request::CallRequest;
@@ -8,7 +8,7 @@ use core::libexecutor::Genesis;
 use error::ErrorCode;
 use jsonrpc_types::rpctypes::{BlockNumber, BlockTag, CountOrCode, MetaData};
 use libproto::auth::Miscellaneous;
-use libproto::blockchain::{BlockWithProof, Proof, ProofType, RichStatus};
+use libproto::blockchain::{BlockWithProof, Proof, ProofType, RichStatus, StateSignal};
 use libproto::consensus::SignedProposal;
 use libproto::request::Request_oneof_req as Request;
 use libproto::router::{MsgType, RoutingKey, SubModules};
@@ -43,8 +43,6 @@ pub struct ExecutorInstance {
     pub ext: Arc<Executor>,
     pub grpc_port: u16,
     closed_block: RefCell<Option<ClosedBlock>>,
-    chain_status: RichStatus,
-    local_sync_count: u8,
     pub is_snapshot: bool,
 }
 
@@ -59,22 +57,20 @@ impl ExecutorInstance {
         let nosql_path = DataPath::root_node_path() + "/statedb";
         let db = Database::open(&config, &nosql_path).unwrap();
 
-        let mut genesis = Genesis::init(genesis_path);
+        let genesis = Genesis::init(genesis_path);
 
         let executor_config = Config::new(config_path);
         let grpc_port = executor_config.grpc_port;
-        let mut executor = Executor::init_executor(Arc::new(db), genesis, executor_config);
+        let executor = Executor::init_executor(Arc::new(db), genesis, &executor_config);
         let executor = Arc::new(executor);
         executor.set_gas_and_nodes(executor.get_max_height());
         executor.send_executed_info_to_chain(executor.get_max_height(), &ctx_pub);
         ExecutorInstance {
-            ctx_pub: ctx_pub,
-            write_sender: write_sender,
+            ctx_pub,
+            write_sender,
             ext: executor,
-            grpc_port: grpc_port,
+            grpc_port,
             closed_block: RefCell::new(None),
-            chain_status: RichStatus::new(),
-            local_sync_count: 0,
             is_snapshot: false,
         }
     }
@@ -95,8 +91,29 @@ impl ExecutorInstance {
 
             routing_key!(Chain >> RichStatus) => {
                 if let Some(status) = msg.take_rich_status() {
-                    self.execute_chain_status(status);
+                    self.execute_chain_status(&status);
                 };
+            }
+
+            routing_key!(Chain >> StateSignal) => {
+                if let Some(state_signal) = msg.take_state_signal() {
+                    let specified_height = state_signal.get_height();
+                    if specified_height < self.ext.get_current_height() {
+                        self.ext
+                            .send_executed_info_to_chain(specified_height + 1, &self.ctx_pub);
+                        let executed_result = {
+                            let executed_result = self.ext.executed_result.read();
+                            executed_result.clone()
+                        };
+                        for height in executed_result.keys() {
+                            if *height > specified_height + 1 {
+                                self.ext.send_executed_info_to_chain(*height, &self.ctx_pub);
+                            }
+                        }
+                    } else if specified_height > self.ext.get_current_height() {
+                        self.signal_to_chain(&self.ctx_pub);
+                    }
+                }
             }
 
             routing_key!(Consensus >> BlockWithProof) => {
@@ -104,7 +121,7 @@ impl ExecutorInstance {
                 self.consensus_block_enqueue(proof_blk);
             }
 
-            routing_key!(Net >> SyncResponse) => {
+            routing_key!(Net >> SyncResponse) | routing_key!(Chain >> LocalSync) => {
                 let sync_res = msg.take_sync_response().unwrap();
                 self.deal_sync_blocks(sync_res);
             }
@@ -161,20 +178,23 @@ impl ExecutorInstance {
                         match stage {
                             // Match before proposal
                             Stage::WaitFinalized => {
-                                if let Some(closed_block) = self.closed_block.replace(None) {
+                                {
+                                    *self.ext.stage.write() = Stage::ExecutingBlock;
+                                }
+                                match self.closed_block.replace(None) {
+                                    Some(ref closed_block)
+                                        if closed_block.is_equivalent(&block) =>
                                     {
-                                        *self.ext.stage.write() = Stage::ExecutingBlock;
+                                        self.ext.finalize_proposal(
+                                            closed_block.clone(),
+                                            &block,
+                                            &self.ctx_pub,
+                                        );
                                     }
-                                    self.ext
-                                        .finalize_proposal(closed_block, block, &self.ctx_pub);
-                                } else {
-                                    // Maybe never reach
-                                    debug!("at WaitFinalized, but no closed block found!");
-                                    {
-                                        *self.ext.stage.write() = Stage::ExecutingBlock;
+                                    _ => {
+                                        self.ext.execute_block(block, &self.ctx_pub);
                                     }
-                                    self.ext.execute_block(block, &self.ctx_pub);
-                                };
+                                }
                             }
                             // Not receive proposal
                             Stage::Idle => {
@@ -236,7 +256,7 @@ impl ExecutorInstance {
                         Some(BlockInQueue::ConsensusBlock(coming, _)) => {
                             if coming.is_equivalent(&closed_block) {
                                 self.ext
-                                    .finalize_proposal(closed_block, coming, &self.ctx_pub);
+                                    .finalize_proposal(closed_block, &coming, &self.ctx_pub);
                                 info!("execute proposal block [height {}] finish !", number);
                             } else {
                                 // Maybe never reach
@@ -278,12 +298,12 @@ impl ExecutorInstance {
 
     fn get_auth_miscellaneous(&self) {
         let sys_config = SysConfig::new(&self.ext);
+        let chain_id = sys_config
+            .chain_id()
+            .unwrap_or_else(SysConfig::default_chain_id);
         let mut miscellaneous = Miscellaneous::new();
-        miscellaneous.set_chain_id(sys_config.chain_id());
-        trace!(
-            "the chain id captured in executor is {}",
-            sys_config.chain_id()
-        );
+        miscellaneous.set_chain_id(chain_id);
+        trace!("the chain id captured in executor is {}", chain_id);
         let msg: Message = miscellaneous.into();
 
         self.ctx_pub
@@ -301,7 +321,7 @@ impl ExecutorInstance {
         match req.req.unwrap() {
             Request::call(call) => {
                 trace!("Chainvm Call {:?}", call);
-                serde_json::from_str::<BlockNumber>(&call.height)
+                let _ = serde_json::from_str::<BlockNumber>(&call.height)
                     .map(|block_id| {
                         let call_request = CallRequest::from(call);
                         self.ext
@@ -322,7 +342,7 @@ impl ExecutorInstance {
 
             Request::transaction_count(tx_count) => {
                 trace!("transaction count request from jsonrpc {:?}", tx_count);
-                serde_json::from_str::<CountOrCode>(&tx_count)
+                let _ = serde_json::from_str::<CountOrCode>(&tx_count)
                     .map_err(|err| {
                         response.set_code(ErrorCode::query_error());
                         response.set_error_msg(format!("{:?}", err));
@@ -342,86 +362,75 @@ impl ExecutorInstance {
 
             Request::code(code_content) => {
                 trace!("code request from jsonrpc  {:?}", code_content);
-                serde_json::from_str::<CountOrCode>(&code_content)
+                let _ = serde_json::from_str::<CountOrCode>(&code_content)
                     .map_err(|err| {
                         response.set_code(ErrorCode::query_error());
                         response.set_error_msg(format!("{:?}", err));
                     })
                     .map(|code_content| {
                         let address = Address::from_slice(code_content.address.as_ref());
-                        match self.ext.code_at(&address, code_content.block_id.into()) {
-                            Some(code) => match code {
-                                Some(code) => {
-                                    response.set_contract_code(code);
-                                }
-                                None => {
-                                    response.set_contract_code(vec![]);
-                                }
-                            },
-                            None => {
-                                response.set_contract_code(vec![]);
-                            }
+                        if let Some(code) = self.ext.code_at(&address, code_content.block_id.into())
+                        {
+                            response.set_contract_code(code);
+                        } else {
+                            response.set_contract_code(vec![]);
                         };
                     });
             }
 
             Request::abi(abi_content) => {
                 trace!("abi request from jsonrpc  {:?}", abi_content);
-                serde_json::from_str::<CountOrCode>(&abi_content)
+                let _ = serde_json::from_str::<CountOrCode>(&abi_content)
                     .map_err(|err| {
                         response.set_code(ErrorCode::query_error());
                         response.set_error_msg(format!("{:?}", err));
                     })
                     .map(|abi_content| {
                         let address = Address::from_slice(abi_content.address.as_ref());
-                        match self.ext.abi_at(&address, abi_content.block_id.into()) {
-                            Some(abi) => match abi {
-                                Some(abi) => {
-                                    response.set_contract_abi(abi);
-                                }
-                                None => {
-                                    response.set_contract_abi(vec![]);
-                                }
-                            },
-                            None => {
-                                response.set_contract_abi(vec![]);
-                            }
+                        if let Some(abi) = self.ext.abi_at(&address, abi_content.block_id.into()) {
+                            response.set_contract_abi(abi);
+                        } else {
+                            response.set_contract_abi(vec![]);
                         };
                     });
             }
 
             Request::balance(balance_content) => {
                 trace!("balance request from jsonrpc  {:?}", balance_content);
-                serde_json::from_str::<CountOrCode>(&balance_content)
+                let _ = serde_json::from_str::<CountOrCode>(&balance_content)
                     .map_err(|err| {
                         response.set_code(ErrorCode::query_error());
                         response.set_error_msg(format!("{:?}", err));
                     })
                     .map(|balance_content| {
                         let address = Address::from_slice(balance_content.address.as_ref());
-                        match self
+                        if let Some(balance) = self
                             .ext
                             .balance_at(&address, balance_content.block_id.into())
                         {
-                            Some(balance) => match balance {
-                                Some(balance) => {
-                                    response.set_balance(balance);
-                                }
-                                None => {
-                                    response.set_balance(vec![]);
-                                }
-                            },
-                            None => {
-                                response.set_balance(vec![]);
-                            }
+                            response.set_balance(balance);
+                        } else {
+                            response.set_balance(vec![]);
                         };
                     });
             }
 
             Request::meta_data(data) => {
                 trace!("metadata request from jsonrpc {:?}", data);
-                match serde_json::from_str::<BlockNumber>(&data)
-                    .map_err(|err| (ErrorCode::query_error(), format!("{:?}", err)))
+                let mut metadata = MetaData {
+                    chain_id: 0,
+                    chain_name: "".to_owned(),
+                    operator: "".to_owned(),
+                    website: "".to_owned(),
+                    genesis_timestamp: 0,
+                    validators: Vec::new(),
+                    block_interval: 0,
+                    token_name: "".to_owned(),
+                    token_symbol: "".to_owned(),
+                    token_avatar: "".to_owned(),
+                };
+                let result = serde_json::from_str::<BlockNumber>(&data)
+                    .map_err(|err| format!("{:?}", err))
                     .and_then(|number: BlockNumber| {
                         let current_height = self.ext.get_current_height();
                         let number = match number {
@@ -430,42 +439,60 @@ impl ExecutorInstance {
                             BlockNumber::Tag(BlockTag::Latest) => current_height,
                         };
                         if number > current_height {
-                            Err((
-                                ErrorCode::query_error(),
-                                format!("Block number overflow: {} > {}", number, current_height),
+                            Err(format!(
+                                "Block number overflow: {} > {}",
+                                number, current_height
                             ))
                         } else {
                             Ok(number)
                         }
                     })
-                    .map(|number: u64| {
-                        // TODO: get chain_name by current block number
-                        let block_id = BlockId::Number(number);
+                    .and_then(|number| {
                         let sys_config = SysConfig::new(&self.ext);
-                        let genesis_timestamp = self
-                            .ext
+                        let block_id = BlockId::Number(number);
+                        sys_config
+                            .chain_id()
+                            .map(|chain_id| metadata.chain_id = chain_id)
+                            .ok_or_else(|| "Query chain id failed".to_owned())?;
+                        sys_config
+                            .chain_name(Some(block_id))
+                            .map(|chain_name| metadata.chain_name = chain_name)
+                            .ok_or_else(|| "Query chain name failed".to_owned())?;
+                        sys_config
+                            .operator(Some(block_id))
+                            .map(|operator| metadata.operator = operator)
+                            .ok_or_else(|| "Query operator failed".to_owned())?;
+                        sys_config
+                            .chain_name(Some(block_id))
+                            .map(|website| metadata.website = website)
+                            .ok_or_else(|| "Query website failed".to_owned())?;
+                        self.ext
                             .block_header(BlockId::Earliest)
-                            .unwrap()
-                            .timestamp();
-                        let token = sys_config.token_info();
-                        MetaData {
-                            genesis_timestamp,
-                            chain_id: sys_config.chain_id(),
-                            chain_name: sys_config.chain_name(Some(block_id)),
-                            operator: sys_config.operator(Some(block_id)),
-                            website: sys_config.website(Some(block_id)),
-                            validators: self.ext.node_manager().shuffled_stake_nodes(),
-                            block_interval: sys_config.block_interval(),
-                            token_name: token.name,
-                            token_avatar: token.avatar,
-                            token_symbol: token.symbol,
-                        }
-                    }) {
-                    Ok(metadata) => {
-                        response.set_meta_data(serde_json::to_string(&metadata).unwrap())
-                    }
-                    Err((code, error_msg)) => {
-                        response.set_code(code);
+                            .map(|header| metadata.genesis_timestamp = header.timestamp())
+                            .ok_or_else(|| "Query genesis_timestamp failed".to_owned())?;
+                        self.ext
+                            .node_manager()
+                            .shuffled_stake_nodes()
+                            .map(|validators| metadata.validators = validators)
+                            .ok_or_else(|| "Query validators failed".to_owned())?;
+                        sys_config
+                            .block_interval()
+                            .map(|block_interval| metadata.block_interval = block_interval)
+                            .ok_or_else(|| "Query block_interval failed".to_owned())?;
+                        sys_config
+                            .token_info()
+                            .map(|token_info| {
+                                metadata.token_name = token_info.name;
+                                metadata.token_avatar = token_info.avatar;
+                                metadata.token_symbol = token_info.symbol;
+                            })
+                            .ok_or_else(|| "Query token info failed".to_owned())?;
+                        Ok(())
+                    });
+                match result {
+                    Ok(_) => response.set_meta_data(serde_json::to_string(&metadata).unwrap()),
+                    Err(error_msg) => {
+                        response.set_code(ErrorCode::query_error());
                         response.set_error_msg(error_msg);
                     }
                 }
@@ -473,7 +500,7 @@ impl ExecutorInstance {
 
             Request::state_proof(state_info) => {
                 trace!("state_proof info is {:?}", state_info);
-                serde_json::from_str::<BlockNumber>(&state_info.height)
+                let _ = serde_json::from_str::<BlockNumber>(&state_info.height)
                     .map(|block_id| {
                         match self.ext.state_at(block_id.into()).and_then(|state| {
                             state.get_state_proof(
@@ -543,10 +570,10 @@ impl ExecutorInstance {
             match stage {
                 Stage::ExecutingProposal => {
                     if let Some(BlockInQueue::Proposal(value)) = block_in_queue {
-                        if !value.is_equivalent(&block) {
-                            if !self.ext.is_interrupted.load(Ordering::SeqCst) {
-                                self.ext.is_interrupted.store(true, Ordering::SeqCst);
-                            }
+                        if !value.is_equivalent(&block)
+                            && !self.ext.is_interrupted.load(Ordering::SeqCst)
+                        {
+                            self.ext.is_interrupted.store(true, Ordering::SeqCst);
                         }
                         self.send_block(blk_height, block, proof);
                     }
@@ -613,7 +640,7 @@ impl ExecutorInstance {
             self.closed_block.replace(None);
             let number = self.ext.get_current_height() + 1;
             debug!("sync block number is {}", number);
-            self.write_sender.send(number);
+            let _ = self.write_sender.send(number);
         }
     }
 
@@ -810,7 +837,7 @@ impl ExecutorInstance {
                 .insert(blk_height, BlockInQueue::ConsensusBlock(block, proof));
         };
         self.ext.set_max_height(blk_height as usize);
-        self.write_sender.send(blk_height);
+        let _ = self.write_sender.send(blk_height);
     }
 
     fn send_proposal(&self, blk_height: u64, block: Block) {
@@ -820,7 +847,19 @@ impl ExecutorInstance {
                 .write()
                 .insert(blk_height, BlockInQueue::Proposal(block));
         };
-        self.write_sender.send(blk_height);
+        let _ = self.write_sender.send(blk_height);
+    }
+
+    pub fn signal_to_chain(&self, ctx_pub: &Sender<(String, Vec<u8>)>) {
+        let mut state_signal = StateSignal::new();
+        state_signal.set_height(self.ext.get_current_height());
+        let msg: Message = state_signal.into();
+        ctx_pub
+            .send((
+                routing_key!(Executor >> StateSignal).into(),
+                msg.try_into().unwrap(),
+            ))
+            .unwrap();
     }
 
     fn deal_snapshot_req(&mut self, snapshot_req: &SnapshotReq) {
@@ -831,8 +870,11 @@ impl ExecutorInstance {
                 let ext = self.ext.clone();
                 let snapshot_req = snapshot_req.clone();
                 let ctx_pub = self.ctx_pub.clone();
-                thread::spawn(move || {
-                    take_snapshot(ext, &snapshot_req);
+                let snapshot_builder = thread::Builder::new().name("snapshot_executor".into());
+                let _ = snapshot_builder.spawn(move || {
+                    take_snapshot(&ext, &snapshot_req);
+
+                    info!("Taking snapshot finished!!!");
 
                     //resp SnapshotAck to snapshot_tool
                     resp.set_resp(Resp::SnapshotAck);
@@ -852,7 +894,7 @@ impl ExecutorInstance {
             }
             Cmd::Restore => {
                 info!("[snapshot] receive {:?}", snapshot_req);
-                match restore_snapshot(self.ext.clone(), snapshot_req) {
+                match restore_snapshot(&self.ext, snapshot_req) {
                     Ok(_) => {
                         resp.set_flag(true);
                     }
@@ -884,27 +926,13 @@ impl ExecutorInstance {
 
     /// The processing logic here is the same as the network pruned/re-transmitted information based on
     /// the state of the chain, but here is pruned/re-transmitted `ExecutedResult`.
-    fn execute_chain_status(&mut self, status: RichStatus) {
-        let old_chain_height = self.chain_status.get_height();
-        let new_chain_height = status.get_height();
-        self.ext.prune_execute_result_cache(&status);
-
-        self.chain_status = status;
-
-        if old_chain_height == new_chain_height && self.local_sync_count < u8::MAX {
-            // Chain height does not increase
-            self.local_sync_count += 1;
-        }
-
-        if self.local_sync_count >= 3 && new_chain_height < self.ext.get_current_height() {
-            self.ext
-                .send_executed_info_to_chain(new_chain_height + 1, &self.ctx_pub);
-            self.local_sync_count = 0;
-        }
+    #[inline]
+    fn execute_chain_status(&mut self, status: &RichStatus) {
+        self.ext.prune_execute_result_cache(status);
     }
 }
 
-fn take_snapshot(ext: Arc<Executor>, snapshot_req: &SnapshotReq) {
+fn take_snapshot(ext: &Arc<Executor>, snapshot_req: &SnapshotReq) {
     // use given path
     let file_name = snapshot_req.file.clone() + "_executor.rlp";
     let writer = PackedWriter {
@@ -933,7 +961,7 @@ fn take_snapshot(ext: Arc<Executor>, snapshot_req: &SnapshotReq) {
     snapshot::take_snapshot(&ext, start_hash, db.as_hashdb(), writer, &*progress).unwrap();
 }
 
-fn restore_snapshot(ext: Arc<Executor>, snapshot_req: &SnapshotReq) -> Result<(), String> {
+fn restore_snapshot(ext: &Arc<Executor>, snapshot_req: &SnapshotReq) -> Result<(), String> {
     let file_name = snapshot_req.file.clone() + "_executor.rlp";
     let reader = PackedReader::new(Path::new(&file_name))
         .map_err(|e| format!("Couldn't open snapshot file: {}", e))
@@ -946,7 +974,7 @@ fn restore_snapshot(ext: Arc<Executor>, snapshot_req: &SnapshotReq) -> Result<()
         }
     };
 
-    let mut db_config = DatabaseConfig::with_columns(db::NUM_COLUMNS);
+    let db_config = DatabaseConfig::with_columns(db::NUM_COLUMNS);
     let snap_path = DataPath::root_node_path() + "/snapshot_executor";
     let snapshot_params = SnapServiceParams {
         db_config: db_config.clone(),
@@ -958,7 +986,7 @@ fn restore_snapshot(ext: Arc<Executor>, snapshot_req: &SnapshotReq) -> Result<()
 
     let snapshot = SnapshotService::new(snapshot_params).unwrap();
     let snapshot = Arc::new(snapshot);
-    match snapshot::restore_using(snapshot, &reader, true) {
+    match snapshot::restore_using(&snapshot, &reader, true) {
         Ok(_) => Ok(()),
         Err(e) => {
             warn!("restore_using failed: {:?}", e);

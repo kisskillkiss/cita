@@ -11,6 +11,8 @@
 //!     | -------- | --------- | ------------------ |
 //!     | executor | Chain     | Request            |
 //!     | executor | Chain     | Richstatus         |
+//!     | executor | Chain     | StateSignal        |
+//!     | executor | Chain     | LocalSync          |
 //!     | executor | Consensus | BlockWithProof     |
 //!     | executor | Consensus | SignedProposal     |
 //!     | executor | Consensus | MiscellaneousReq   |
@@ -27,6 +29,7 @@
 //!     | executor | Executor  | Chain     | ExecutedResult |
 //!     | executor | Executor  | Auth      | Miscellaneous  |
 //!     | executor | Executor  | Auth      | BlackList      |
+//!     | executor | Executor  | Chain     | StateSignal    |
 //!
 //! ### Key behavior
 //!
@@ -61,9 +64,6 @@
 //! [`StateDB`]: ../core_executor/state_db/struct.StateDB.html
 //!
 
-#![feature(custom_attribute)]
-#![allow(deprecated, unused_must_use, unused_mut, unused_assignments)]
-#![feature(refcell_replace_swap)]
 #![feature(try_from)]
 extern crate cita_types;
 extern crate clap;
@@ -123,6 +123,8 @@ fn main() {
         routing_key!([
             Chain >> Request,
             Chain >> RichStatus,
+            Chain >> StateSignal,
+            Chain >> LocalSync,
             Consensus >> BlockWithProof,
             Consensus >> SignedProposal,
             Net >> SyncResponse,
@@ -134,7 +136,7 @@ fn main() {
         crx_pub,
     );
 
-    let mut ext_instance =
+    let ext_instance =
         ExecutorInstance::new(ctx_pub.clone(), write_sender, config_path, genesis_path);
     let mut distribute_ext = ext_instance.clone();
 
@@ -155,22 +157,15 @@ fn main() {
 
     let mut timeout_factor = 0u8;
     loop {
-        if let Ok(number) =
-            write_receiver.recv_timeout(Duration::new(18 * (2u64.pow(timeout_factor as u32)), 0))
+        if let Ok(number) = write_receiver
+            .recv_timeout(Duration::new(18 * (2u64.pow(u32::from(timeout_factor))), 0))
         {
             ext_instance.execute_block(number);
             timeout_factor = 0;
-        } else {
-            if !ext_instance.is_snapshot {
-                info!("Executor enters the timeout retransmission phase");
-                for height in ext_instance.ext.executed_result.read().keys() {
-                    ext_instance
-                        .ext
-                        .send_executed_info_to_chain(*height, &ctx_pub);
-                }
-                if timeout_factor < 6 {
-                    timeout_factor += 1
-                }
+        } else if !ext_instance.is_snapshot {
+            info!("Executor enters the timeout");
+            if timeout_factor < 6 {
+                timeout_factor += 1
             }
         }
     }

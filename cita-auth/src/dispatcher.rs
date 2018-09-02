@@ -39,13 +39,18 @@ impl Dispatcher {
         let mut dispatch = Dispatcher {
             txs_pool: RefCell::new(tx_pool::Pool::new(0)),
             wal: TxWal::new("/txwal"),
-            wal_enable: wal_enable,
+            wal_enable,
         };
 
         // restore tx data from wal to txs_pool
         if wal_enable {
             let num = dispatch.read_tx_from_wal();
             info!("recovery [{}] transactions into pool.", num);
+        } else {
+            /* prev: enable or disable  now: disable -> delete prev saved
+               prev: enable or disable  now: enable  -> read prev saved
+            */
+            dispatch.wal.regenerate("/txwal");
         }
         dispatch
     }
@@ -150,7 +155,6 @@ impl Dispatcher {
     // Read tx information from wal, and restore to txs_pool.
     // This function will be called in Dispatcher::new().
     pub fn read_tx_from_wal(&mut self) -> u64 {
-        let size = self.wal.read(&mut self.txs_pool.borrow_mut());
-        size
+        self.wal.read(&mut self.txs_pool.borrow_mut())
     }
 }

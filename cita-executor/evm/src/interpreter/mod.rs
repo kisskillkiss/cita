@@ -63,11 +63,10 @@ struct CodeReader<'a> {
     code: &'a [u8],
 }
 
-#[cfg_attr(feature = "dev", allow(len_without_is_empty))]
 impl<'a> CodeReader<'a> {
     /// Create new code reader - starting at position 0.
     fn new(code: &'a [u8]) -> Self {
-        CodeReader { position: 0, code: code }
+        CodeReader { position: 0, code }
     }
 
     /// Get `no_of_bytes` from code and convert to U256. Move PC
@@ -110,7 +109,7 @@ pub struct Interpreter<Cost: CostType> {
 }
 
 impl<Cost: CostType> evm::Evm for Interpreter<Cost> {
-    fn exec(&mut self, params: ActionParams, ext: &mut Ext) -> Result<GasLeft> {
+    fn exec(&mut self, params: &ActionParams, ext: &mut Ext) -> Result<GasLeft> {
         self.mem.clear();
 
         let mut informant = informant::EvmInformant::new(ext.depth());
@@ -151,7 +150,7 @@ impl<Cost: CostType> evm::Evm for Interpreter<Cost> {
             };
 
             // Execute instruction
-            let result = self.exec_instruction(gasometer.current_gas, &params, ext, instruction, &mut reader, &mut stack, requirements.provide_gas)?;
+            let result = self.exec_instruction(gasometer.current_gas, params, ext, instruction, &mut reader, &mut stack, requirements.provide_gas)?;
 
             evm_debug!({
                            informant.after_instruction(instruction)
@@ -194,7 +193,7 @@ impl<Cost: CostType> Interpreter<Cost> {
     pub fn new(cache: Arc<SharedCache>) -> Interpreter<Cost> {
         Interpreter {
             mem: Vec::new(),
-            cache: cache,
+            cache,
             return_data: ReturnData::empty(),
             _type: PhantomData::default(),
         }
@@ -204,7 +203,7 @@ impl<Cost: CostType> Interpreter<Cost> {
         let schedule = ext.schedule();
 
         if info.tier == instructions::GasPriceTier::Invalid {
-            return Err(Error::BadInstruction { instruction: instruction });
+            return Err(Error::BadInstruction { instruction });
         }
 
         if !stack.has(info.args) {
@@ -245,7 +244,7 @@ impl<Cost: CostType> Interpreter<Cost> {
         }
     }
 
-    #[cfg_attr(feature = "dev", allow(too_many_arguments))]
+    #[allow(unknown_lints, too_many_arguments)] // TODO clippy
     fn exec_instruction(&mut self, gas: Cost, params: &ActionParams, ext: &mut Ext, instruction: Instruction, code: &mut CodeReader, stack: &mut Stack<U256>, provided: Option<Cost>) -> Result<InstructionResult<Cost>> {
         match instruction {
             instructions::JUMP => {
@@ -359,7 +358,7 @@ impl<Cost: CostType> Interpreter<Cost> {
                 let call_result = {
                     // we need to write and read from memory in the same time
                     // and we don't want to copy
-                    let input = unsafe { ::std::mem::transmute(self.mem.read_slice(in_off, in_size)) };
+                    let input = unsafe { &*(self.mem.read_slice(in_off, in_size) as *const [u8]) };
                     let output = self.mem.writeable_slice(out_off, out_size);
                     ext.call(&call_gas.as_u256(), sender_address, receive_address, value, input, &code_address, output, call_type)
                 };
@@ -385,13 +384,13 @@ impl<Cost: CostType> Interpreter<Cost> {
                 let init_off = stack.pop_back();
                 let init_size = stack.pop_back();
 
-                return Ok(InstructionResult::StopExecutionNeedsReturn {gas: gas, init_off: init_off, init_size: init_size, apply: true})
+                return Ok(InstructionResult::StopExecutionNeedsReturn { gas, init_off, init_size, apply: true})
             }
             instructions::REVERT => {
                 let init_off = stack.pop_back();
                 let init_size = stack.pop_back();
 
-                return Ok(InstructionResult::StopExecutionNeedsReturn {gas: gas, init_off: init_off, init_size: init_size, apply: false})
+                return Ok(InstructionResult::StopExecutionNeedsReturn { gas, init_off, init_size, apply: false})
               }
             instructions::STOP => {
                 return Ok(InstructionResult::StopExecution);
@@ -416,7 +415,7 @@ impl<Cost: CostType> Interpreter<Cost> {
             }
             instructions::MLOAD => {
                 let word = self.mem.read(stack.pop_back());
-                stack.push(U256::from(word));
+                stack.push(word);
             }
             instructions::MSTORE => {
                 let offset = stack.pop_back();
@@ -835,7 +834,7 @@ impl<Cost: CostType> Interpreter<Cost> {
                 // We cannot use get_and_reset_sign/set_sign here, because the rounding looks different.
 
                 const CONST_256: U256 = U256([256, 0, 0, 0]);
-                const CONST_HIBIT: U256 = U256([0, 0, 0, 0x8000000000000000]);
+                const CONST_HIBIT: U256 = U256([0, 0, 0, 0x8000_0000_0000_0000]);
 
                 let shift = stack.pop_back();
                 let value = stack.pop_back();
@@ -858,7 +857,7 @@ impl<Cost: CostType> Interpreter<Cost> {
                 stack.push(result);
             },
             _ => {
-                return Err(Error::BadInstruction { instruction: instruction });
+                return Err(Error::BadInstruction { instruction });
             }
         }
         Ok(())

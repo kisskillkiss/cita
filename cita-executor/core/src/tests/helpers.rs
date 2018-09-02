@@ -178,7 +178,7 @@ pub fn init_executor(contract_arguments: Vec<(&str, &str)>) -> Arc<Executor> {
     Arc::new(Executor::init_executor(
         Arc::new(db),
         genesis,
-        executor_config,
+        &executor_config,
     ))
 }
 
@@ -187,7 +187,7 @@ pub fn init_chain() -> Arc<chain::Chain> {
     let config = DatabaseConfig::with_columns(db::NUM_COLUMNS);
     let db = Database::open(&config, &tempdir.to_str().unwrap()).unwrap();
     let chain_config = chain::Config::new(CHAIN_CONFIG);
-    Arc::new(chain::Chain::init_chain(Arc::new(db), chain_config))
+    Arc::new(chain::Chain::init_chain(Arc::new(db), &chain_config))
 }
 
 pub fn create_block(executor: &Executor, to: Address, data: &Vec<u8>, nonce: (u32, u32)) -> Block {

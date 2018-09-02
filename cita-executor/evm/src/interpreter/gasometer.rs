@@ -32,7 +32,6 @@ macro_rules! overflowing {
     }}
 }
 
-#[cfg_attr(feature = "dev", allow(enum_variant_names))]
 enum Request<Cost: CostType> {
     Gas(Cost),
     GasMem(Cost, Cost),
@@ -55,13 +54,13 @@ pub struct Gasometer<Gas: CostType> {
 impl<Gas: CostType> Gasometer<Gas> {
     pub fn new(current_gas: Gas) -> Self {
         Gasometer {
-            current_gas: current_gas,
+            current_gas,
             current_mem_gas: Gas::from(0),
         }
     }
 
     pub fn verify_gas(&self, gas_cost: &Gas) -> Result<()> {
-        if &self.current_gas < gas_cost { Err(Error::OutOfGas) } else { Ok(()) }
+        if self.current_gas < *gas_cost { Err(Error::OutOfGas) } else { Ok(()) }
     }
 
     /// How much gas is provided to a CALL/CREATE, given that we need to deduct `needed` for this operation
@@ -80,16 +79,13 @@ impl<Gas: CostType> Gasometer<Gas> {
             };
 
             if let Some(Ok(r)) = requested { Ok(cmp::min(r, max_gas_provided)) } else { Ok(max_gas_provided) }
+        } else if let Some(r) = requested {
+            r
         } else {
-            if let Some(r) = requested {
-                r
-            } else {
-                Ok(0.into())
-            }
+            Ok(0.into())
         }
     }
 
-    #[cfg_attr(feature = "dev", allow(cyclomatic_complexity))]
     /// Determine how much gas is used by the given instruction, given the machine's state.
     ///
     /// We guarantee that the final element of the returned tuple (`provided`) will be `Some`

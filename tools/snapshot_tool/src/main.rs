@@ -20,6 +20,7 @@
 extern crate clap;
 extern crate dotenv;
 extern crate error;
+extern crate fs2;
 #[macro_use]
 extern crate libproto;
 #[macro_use]
@@ -31,14 +32,27 @@ extern crate util;
 mod snapshot_tool;
 
 use clap::App;
+use fs2::FileExt;
 use libproto::router::{MsgType, RoutingKey, SubModules};
 use pubsub::start_pubsub;
 use snapshot_tool::SnapShot;
+use std::fs::{self, OpenOptions};
 use std::sync::mpsc::channel;
 use util::set_panic_handler;
 
+const SNAPSHOT_FILE: &str = ".cita_snapshot";
+
 fn main() {
     micro_service_init!("cita-snapshot", "CITA:snapshot");
+
+    // Judge whether snapshot_tool have started.
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(SNAPSHOT_FILE)
+        .expect("Failed to open lock file");
+    f.try_lock_exclusive().expect("snapshot already started.");
 
     let matches = App::new("snapshot")
         .version("0.1")
@@ -52,16 +66,20 @@ fn main() {
 
     let cmd = matches.value_of("cmd").unwrap_or("snapshot");
     let file = matches.value_of("file").unwrap_or("snapshot");
-    let start_height = matches
-        .value_of("start_height")
-        .unwrap_or("0")
-        .parse::<u64>()
-        .unwrap();
-    let end_height = matches
-        .value_of("end_height")
-        .unwrap_or("0")
-        .parse::<u64>()
-        .unwrap();
+
+    let s = matches.value_of("start_height").unwrap_or("0");
+    let start_height = if s.starts_with("0x") | s.starts_with("0X") {
+        u64::from_str_radix(&s[2..], 16).unwrap()
+    } else {
+        u64::from_str_radix(s, 10).unwrap()
+    };
+
+    let e = matches.value_of("end_height").unwrap_or("0");
+    let end_height = if e.starts_with("0x") | e.starts_with("0X") {
+        u64::from_str_radix(&e[2..], 16).unwrap()
+    } else {
+        u64::from_str_radix(e, 10).unwrap()
+    };
 
     let (tx, rx) = channel();
     let (ctx_pub, crx_pub) = channel();
@@ -90,15 +108,21 @@ fn main() {
             snapshot_instance.begin();
             println!("snapshot_tool send restore cmd");
         }
-        _ => println!("snapshot_tool send error cmd"),
+        _ => {
+            println!("snapshot_tool send error cmd");
+            return;
+        }
     }
     let mut exit = false;
     loop {
         if let Ok((key, msg)) = rx.recv() {
             info!("snapshot_tool receive ack key: {:?}", key);
-            exit = snapshot_instance.parse_data(key, msg);
+            exit = snapshot_instance.parse_data(&key, &msg);
         }
         if exit {
+            // Remove the file
+            f.unlock().unwrap();
+            let _ = fs::remove_file(SNAPSHOT_FILE);
             break;
         }
     }

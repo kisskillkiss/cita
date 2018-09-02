@@ -72,9 +72,9 @@ impl Forward {
         write_sender: Sender<ExecutedResult>,
     ) -> Forward {
         Forward {
-            chain: chain,
-            ctx_pub: ctx_pub,
-            write_sender: write_sender,
+            chain,
+            ctx_pub,
+            write_sender,
         }
     }
 
@@ -92,6 +92,15 @@ impl Forward {
             routing_key!(Executor >> ExecutedResult) => {
                 let info = msg.take_executed_result().unwrap();
                 self.write_sender.send(info).unwrap();
+            }
+
+            routing_key!(Executor >> StateSignal) => {
+                if let Some(state_signal) = msg.take_state_signal() {
+                    let specified_height = state_signal.get_height();
+                    let missing_blocks =
+                        (specified_height + 1..=self.chain.get_current_height()).collect();
+                    self.reply_local_syn_req(missing_blocks);
+                }
             }
 
             routing_key!(Consensus >> BlockWithProof) => {
@@ -224,17 +233,15 @@ impl Forward {
 
             Request::filter(encoded) => {
                 trace!("filter: {:?}", encoded);
-                serde_json::from_str::<RpcFilter>(&encoded)
-                    .map_err(|err| {
-                        response.set_code(ErrorCode::query_error());
-                        response.set_error_msg(format!("{:?}", err));
-                    })
-                    .map(|rpc_filter| {
-                        let filter: Filter = rpc_filter.into();
-                        let logs = self.chain.get_logs(filter);
-                        let rpc_logs: Vec<RpcLog> = logs.into_iter().map(|x| x.into()).collect();
-                        response.set_logs(serde_json::to_string(&rpc_logs).unwrap());
-                    });
+                if let Ok(rpc_filter) = serde_json::from_str::<RpcFilter>(&encoded).map_err(|err| {
+                    response.set_code(ErrorCode::query_error());
+                    response.set_error_msg(format!("{:?}", err));
+                }) {
+                    let filter: Filter = rpc_filter.into();
+                    let logs = self.chain.get_logs(&filter);
+                    let rpc_logs: Vec<RpcLog> = logs.into_iter().map(|x| x.into()).collect();
+                    response.set_logs(serde_json::to_string(&rpc_logs).unwrap());
+                };
             }
 
             Request::call(call) => {
@@ -385,7 +392,7 @@ impl Forward {
             self.chain.set_max_store_height(blk_height as u64);
             let tx_hashes = rblock.body().transaction_hashes();
             self.chain
-                .delivery_block_tx_hashes(blk_height as u64, tx_hashes, &self.ctx_pub);
+                .delivery_block_tx_hashes(blk_height as u64, &tx_hashes, &self.ctx_pub);
         }
     }
 
@@ -397,8 +404,53 @@ impl Forward {
             origin, heights
         );
 
+        let res_vec = self.sync_response(heights);
+
+        debug!(
+            "sync: reply node = {}, response blocks len = {}",
+            origin,
+            res_vec.get_blocks().len()
+        );
+        if !res_vec.get_blocks().is_empty() {
+            let msg = Message::init(OperateType::Single, origin, res_vec.into());
+            trace!(
+                "sync: origin {:?}, chain.blk: OperateType {:?}",
+                origin,
+                OperateType::Single
+            );
+            self.ctx_pub
+                .send((
+                    routing_key!(Chain >> SyncResponse).into(),
+                    msg.try_into().unwrap(),
+                ))
+                .unwrap();
+        }
+    }
+
+    fn reply_local_syn_req(&self, heights: Vec<u64>) {
+        let res_vec = self.sync_response(heights);
+        if !res_vec.get_blocks().is_empty() {
+            let msg = Message::init(OperateType::Single, 0, res_vec.into());
+            trace!(
+                "local_sync: chain.blk: OperateType {:?}",
+                OperateType::Single
+            );
+            self.ctx_pub
+                .send((
+                    routing_key!(Chain >> LocalSync).into(),
+                    msg.try_into().unwrap(),
+                ))
+                .unwrap();
+        }
+    }
+
+    #[inline]
+    fn sync_response(&self, heights: Vec<u64>) -> SyncResponse {
         let mut res_vec = SyncResponse::new();
-        for height in heights {
+        for height in heights
+            .into_iter()
+            .filter(|height| *height <= self.chain.get_current_height())
+        {
             if let Some(block) = self.chain.block(BlockId::Number(height)) {
                 res_vec.mut_blocks().push(block.protobuf());
                 //push double
@@ -417,26 +469,7 @@ impl Forward {
                 }
             }
         }
-
-        debug!(
-            "sync: reply node = {}, response blocks len = {}",
-            origin,
-            res_vec.get_blocks().len()
-        );
-        if res_vec.mut_blocks().len() > 0 {
-            let msg = Message::init(OperateType::Single, origin, res_vec.into());
-            trace!(
-                "sync: origin {:?}, chain.blk: OperateType {:?}",
-                origin,
-                OperateType::Single
-            );
-            self.ctx_pub
-                .send((
-                    routing_key!(Chain >> SyncResponse).into(),
-                    msg.try_into().unwrap(),
-                ))
-                .unwrap();
-        }
+        res_vec
     }
 
     fn deal_sync_blocks(&self, mut sync_res: SyncResponse) {
@@ -498,8 +531,7 @@ impl Forward {
                         if let Some(prev_block_in_queue) =
                             self.chain.block_map.write().get_mut(&proof_height)
                         {
-                            if let &mut BlockInQueue::SyncBlock(ref mut value) = prev_block_in_queue
-                            {
+                            if let BlockInQueue::SyncBlock(ref mut value) = *prev_block_in_queue {
                                 if value.1.is_none() {
                                     debug!("sync: set prev sync block proof {}", value.0.number());
                                     mem::swap(&mut value.1, &mut Some(block.proof().clone()));
@@ -532,7 +564,7 @@ impl Forward {
                     if let Some(block_in_queue) =
                         self.chain.block_map.write().get_mut(&proof_height)
                     {
-                        if let &mut BlockInQueue::SyncBlock(ref mut value) = block_in_queue {
+                        if let BlockInQueue::SyncBlock(ref mut value) = *block_in_queue {
                             if value.1.is_none() {
                                 debug!("sync: insert block proof {} in map", proof_height);
                                 mem::swap(&mut value.1, &mut Some(block.proof().clone()));
@@ -553,54 +585,31 @@ impl Forward {
 
     fn deal_block_tx_req(&self, block_tx_hashes_req: &BlockTxHashesReq) {
         let block_height = block_tx_hashes_req.get_height();
-        let tx_hashes: Vec<H256>;
-        let mut need_insert: bool = false;
-        {
-            if let Some(hashes) = self.chain.tx_hashes_cache.write().get_mut(&block_height) {
-                info!(
-                    "get tx_hashes at height {} in chain.tx_hashes",
-                    block_height
-                );
-                tx_hashes = hashes.clone();
-            } else if let Some(hashes) =
-                self.chain.transaction_hashes(BlockId::Number(block_height))
-            {
-                tx_hashes = hashes;
-                need_insert = true;
-            } else {
-                warn!("get block's tx hashes for height:{} error", block_height);
-                return;
-            }
-        }
-        {
-            if need_insert {
-                self.chain
-                    .tx_hashes_cache
-                    .write()
-                    .insert(block_height, tx_hashes.clone());
-            }
-        }
 
-        //prepare and send the block tx hashes to auth
-        let mut block_tx_hashes = BlockTxHashes::new();
-        block_tx_hashes.set_height(block_height);
-        let mut tx_hashes_in_u8 = Vec::new();
-        for tx_hash_in_h256 in &tx_hashes {
-            tx_hashes_in_u8.push(tx_hash_in_h256.to_vec());
-        }
-        block_tx_hashes.set_tx_hashes(tx_hashes_in_u8.into());
-        block_tx_hashes
-            .set_block_gas_limit(self.chain.block_gas_limit.load(Ordering::SeqCst) as u64);
-        block_tx_hashes.set_account_gas_limit(self.chain.account_gas_limit.read().clone().into());
-        let msg: Message = block_tx_hashes.into();
-        self.ctx_pub
-            .send((
-                routing_key!(Chain >> BlockTxHashes).into(),
-                msg.try_into().unwrap(),
-            ))
-            .unwrap();
+        if let Some(tx_hashes) = self.chain.transaction_hashes(BlockId::Number(block_height)) {
+            //prepare and send the block tx hashes to auth
+            let mut block_tx_hashes = BlockTxHashes::new();
+            block_tx_hashes.set_height(block_height);
+            let mut tx_hashes_in_u8 = Vec::new();
+            for tx_hash_in_h256 in &tx_hashes {
+                tx_hashes_in_u8.push(tx_hash_in_h256.to_vec());
+            }
+            block_tx_hashes.set_tx_hashes(tx_hashes_in_u8.into());
+            block_tx_hashes
+                .set_block_gas_limit(self.chain.block_gas_limit.load(Ordering::SeqCst) as u64);
+            block_tx_hashes.set_account_gas_limit(self.chain.account_gas_limit.read().clone());
+            let msg: Message = block_tx_hashes.into();
+            self.ctx_pub
+                .send((
+                    routing_key!(Chain >> BlockTxHashes).into(),
+                    msg.try_into().unwrap(),
+                ))
+                .unwrap();
 
-        trace!("response block's tx hashes for height:{}", block_height);
+            trace!("response block's tx hashes for height:{}", block_height);
+        } else {
+            warn!("get block's tx hashes for height:{} error", block_height);
+        }
     }
 
     fn deal_snapshot_req(&self, snapshot_req: &SnapshotReq) {
@@ -611,8 +620,11 @@ impl Forward {
                 let chain = self.chain.clone();
                 let ctx_pub = self.ctx_pub.clone();
                 let snapshot_req = snapshot_req.clone();
-                thread::spawn(move || {
-                    take_snapshot(chain, &snapshot_req);
+                let snapshot_builder = thread::Builder::new().name("snapshot_chain".into());
+                snapshot_builder.spawn(move || {
+                    take_snapshot(&chain, &snapshot_req);
+
+                    info!("Taking snapshot finished!!!");
 
                     //resp SnapshotAck to snapshot_tool
                     resp.set_resp(Resp::SnapshotAck);
@@ -633,7 +645,7 @@ impl Forward {
             }
             Cmd::Restore => {
                 info!("[snapshot] receive {:?}", snapshot_req);
-                match restore_snapshot(self.chain.clone(), snapshot_req) {
+                match restore_snapshot(&self.chain.clone(), snapshot_req) {
                     Ok(proof) => {
                         resp.set_proof(proof);
                         resp.set_height(self.chain.get_current_height());
@@ -675,7 +687,7 @@ impl Forward {
     }
 }
 
-fn take_snapshot(chain: Arc<Chain>, snapshot_req: &SnapshotReq) {
+fn take_snapshot(chain: &Arc<Chain>, snapshot_req: &SnapshotReq) {
     // use given path
     let file_name = snapshot_req.file.clone() + "_chain.rlp";
     let writer = PackedWriter {
@@ -697,10 +709,10 @@ fn take_snapshot(chain: Arc<Chain>, snapshot_req: &SnapshotReq) {
 
     let progress = Arc::new(Progress::default());
 
-    snapshot::take_snapshot(&chain, block_at, writer, &*progress).unwrap();
+    snapshot::take_snapshot(chain, block_at, writer, &*progress).unwrap();
 }
 
-fn restore_snapshot(chain: Arc<Chain>, snapshot_req: &SnapshotReq) -> Result<Proof, String> {
+fn restore_snapshot(chain: &Arc<Chain>, snapshot_req: &SnapshotReq) -> Result<Proof, String> {
     let file_name = snapshot_req.file.clone() + "_chain.rlp";
     let reader = PackedReader::new(Path::new(&file_name))
         .map_err(|e| format!("Couldn't open snapshot file: {}", e))
@@ -724,7 +736,7 @@ fn restore_snapshot(chain: Arc<Chain>, snapshot_req: &SnapshotReq) -> Result<Pro
 
     let snapshot = SnapshotService::new(snapshot_params).unwrap();
     let snapshot = Arc::new(snapshot);
-    match snapshot::restore_using(Arc::clone(&snapshot), &reader, true) {
+    match snapshot::restore_using(&snapshot, &reader, true) {
         Ok(_) => {
             // return proof
             let proof = reader.manifest().last_proof.clone();
