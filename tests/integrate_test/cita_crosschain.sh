@@ -15,7 +15,7 @@ CMC_ABI=
 CONTRACT_LIBS_DIR="scripts/contracts"
 
 # Templates for some shell commands
-JSONRPC_CALL='{"jsonrpc":"2.0","method":"call", "params":[{"to":"%s", "data":"%s"}, "latest"],"id":2}'
+JSONRPC_CALL='{"jsonrpc":"2.0","method":"call", "params":[{"to":"%s", "data":"%s"}, "pending"],"id":2}'
 JSONRPC_BLOCKHEADER='{"jsonrpc":"2.0","method":"getBlockHeader","params":["0x%x"],"id":1}'
 JSONRPC_STATEPROOF='{"jsonrpc":"2.0","method":"getStateProof","params":["0x%s","0x%s","0x%x"],"id":1}'
 
@@ -115,7 +115,8 @@ function start_chain () {
         bin/cita setup ${chain}chain/${id} && true
     done
     for ((id=0;id<${size};id++)); do
-        bin/cita start ${chain}chain/${id} trace>/dev/null 2>&1 &
+        bin/cita stop  ${chain}chain/${id}>/dev/null 2>&1 || true
+        bin/cita start ${chain}chain/${id} trace>/dev/null 2>&1
     done
 }
 

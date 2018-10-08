@@ -17,6 +17,7 @@
 
 use basic_types::LogBloom;
 use cita_types::{Address, H256, U256};
+use contracts::solc::PriceManagement;
 use engines::Engine;
 use error::Error;
 use evm::env_info::{EnvInfo, LastHashes};
@@ -36,6 +37,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use trace::FlatTrace;
+use types::ids::BlockId;
 use types::transaction::SignedTransaction;
 use util::{merklehash, HeapSizeOf};
 
@@ -400,11 +402,21 @@ impl OpenBlock {
         chain_owner: Address,
         check_options: &CheckOptions,
     ) -> bool {
-        for (index, t) in self.body.transactions.clone().into_iter().enumerate() {
+        let price_management = PriceManagement::new(executor);
+        let quota_price = price_management
+            .quota_price(BlockId::Pending)
+            .unwrap_or_else(PriceManagement::default_quota_price);
+        for (index, mut t) in self.body.transactions.clone().into_iter().enumerate() {
             if index & CHECK_NUM == 0 && executor.is_interrupted.load(Ordering::SeqCst) {
                 executor.is_interrupted.store(false, Ordering::SeqCst);
                 return false;
             }
+
+            let economical_model: EconomicalModel = *executor.economical_model.read();
+            if economical_model == EconomicalModel::Charge {
+                t.gas_price = quota_price;
+            }
+
             self.apply_transaction(
                 &*executor.engine,
                 &t,

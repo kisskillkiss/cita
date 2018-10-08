@@ -23,18 +23,18 @@ contract GroupManagement is ReservedAddress {
 
     modifier onlyLeafNode(address _group) {
         Group group = Group(_group);
-        require(group.queryChildLength() == 0);
+        require(group.queryChildLength() == 0, "Only leaf node.");
         _;
     }
 
     modifier inGroup(address _group) {
         Group group = Group(_group);
-        require(group.inGroup(msg.sender));
+        require(group.inGroup(msg.sender), "Not in group.");
         _;
     }
 
-    modifier checkPermission(address _permission) {
-        require(auth.checkPermission(msg.sender, _permission));
+    modifier checkPermission(address _permission, address _origin) {
+        require(auth.checkPermission(msg.sender, _permission) || auth.checkPermission(_origin, _permission), "Permission denied.");
         _;
     }
 
@@ -49,13 +49,15 @@ contract GroupManagement is ReservedAddress {
     /// @param _name  The name of group
     /// @param _accounts The accounts of group
     /// @return New role's address
+    /// @dev TODO Add a param: target.
     function newGroup(address _origin, bytes32 _name, address[] _accounts)
         external
-        checkPermission(builtInPermissions[10])
+        // Have to check all the permission of account's groups. but can not do it for now.
+        checkPermission(builtInPermissions[10], 0x0)
         returns (address new_group)
     {
         new_group = groupCreator.createGroup(_origin, _name, _accounts);
-        require(addChild(_origin, new_group));
+        require(addChild(_origin, new_group), "addChild failed.");
         groups.push(new_group);
     }
 
@@ -67,13 +69,13 @@ contract GroupManagement is ReservedAddress {
         external
         inGroup(_origin)
         onlyLeafNode(_target)
-        checkPermission(builtInPermissions[11])
+        checkPermission(builtInPermissions[11], _origin)
         returns (bool)
     {
-        require(checkScope(_origin, _target));
+        require(checkScope(_origin, _target), "The target group not in origin group.");
         Group group = Group(_target);
         // Delete it from the parent group
-        require(deleteChild(group.queryParent(), _target));
+        require(deleteChild(group.queryParent(), _target), "deleteChild failed.");
         // Selfdestruct
         group.close();
         // Remove it from the groups
@@ -90,12 +92,12 @@ contract GroupManagement is ReservedAddress {
     function updateGroupName(address _origin, address _target, bytes32 _name)
         external
         inGroup(_origin)
-        checkPermission(builtInPermissions[12])
+        checkPermission(builtInPermissions[12], _origin)
         returns (bool)
     {
-        require(checkScope(_origin, _target));
+        require(checkScope(_origin, _target), "The target not in origin group.");
         Group group = Group(_target);
-        require(group.updateName(_name));
+        require(group.updateName(_name), "updateName failed.");
         return true;
     }
 
@@ -107,12 +109,12 @@ contract GroupManagement is ReservedAddress {
     function addAccounts(address _origin, address _target, address[] _accounts)
         external
         inGroup(_origin)
-        checkPermission(builtInPermissions[12])
+        checkPermission(builtInPermissions[12], _origin)
         returns (bool)
     {
-        require(checkScope(_origin, _target));
+        require(checkScope(_origin, _target), "The target not in origin group.");
         Group group = Group(_target);
-        require(group.addAccounts(_accounts));
+        require(group.addAccounts(_accounts), "addAccounts failed.");
         return true;
     }
 
@@ -124,12 +126,12 @@ contract GroupManagement is ReservedAddress {
     function deleteAccounts(address _origin, address _target, address[] _accounts)
         external
         inGroup(_origin)
-        checkPermission(builtInPermissions[12])
+        checkPermission(builtInPermissions[12], _origin)
         returns (bool)
     {
-        require(checkScope(_origin, _target));
+        require(checkScope(_origin, _target), "The target not in origin group.");
         Group group = Group(_target);
-        require(group.deleteAccounts(_accounts));
+        require(group.deleteAccounts(_accounts), "deleteAccounts failed.");
         return true;
     }
 
@@ -170,7 +172,7 @@ contract GroupManagement is ReservedAddress {
         returns (bool)
     {
         Group group = Group(_group);
-        require(group.deleteChild(_child));
+        require(group.deleteChild(_child), "deleteChild failed.");
         return true;
     }
 
@@ -180,7 +182,7 @@ contract GroupManagement is ReservedAddress {
         returns (bool)
     {
         Group group = Group(_group);
-        require(group.addChild(_child));
+        require(group.addChild(_child), "addChild failed.");
         return true;
     }
 }

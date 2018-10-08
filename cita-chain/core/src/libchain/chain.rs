@@ -47,7 +47,6 @@ use libproto::{BlockTxHashes, FullTransaction, Message};
 use proof::BftProof;
 use receipt::{LocalizedReceipt, Receipt};
 use rlp::{self, Encodable};
-use state::State;
 use state_db::StateDB;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::{Into, TryInto};
@@ -236,15 +235,23 @@ pub enum CacheId {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct Config {
     pub prooftype: u8,
+    pub cache_size: Option<usize>,
 }
 
 impl Config {
     pub fn default() -> Self {
-        Config { prooftype: 2 }
+        Config {
+            prooftype: 2,
+            cache_size: Some(1 << 20),
+        }
     }
 
     pub fn new(path: &str) -> Self {
-        parse_config!(Config, path)
+        let mut c: Config = parse_config!(Config, path);
+        if c.cache_size.is_none() {
+            c.cache_size = Some(1 << 20 as usize);
+        }
+        c
     }
 }
 
@@ -270,9 +277,6 @@ pub enum BlockInQueue {
     SyncBlock((Block, Option<ProtoProof>)),
 }
 
-/// Database read and write and cache
-// TODO: chain对外开放的方法，是保证能正确解析结构，即类似于Result<Block,Err>
-// 所有直接unwrap的地方都可能会报错！
 pub struct Chain {
     pub blooms_config: BloomChainConfig,
     pub current_header: RwLock<Header>,
@@ -309,6 +313,10 @@ pub struct Chain {
 
     // snapshot flag
     pub is_snapshot: RwLock<bool>,
+
+    admin_address: RwLock<Option<Address>>,
+
+    pub version: RwLock<Option<u32>>,
 }
 
 /// Get latest status
@@ -346,8 +354,14 @@ pub fn contract_address(address: &Address, nonce: &U256) -> Address {
 
 impl Chain {
     pub fn init_chain(db: Arc<KeyValueDB>, chain_config: &Config) -> Chain {
+        info!("chain config: {:?}", chain_config);
+
         // 400 is the avarage size of the key
-        let cache_man = CacheManager::new(1 << 14, 1 << 20, 400);
+        let cache_man = CacheManager::new(
+            chain_config.cache_size.unwrap() * 3 / 4,
+            chain_config.cache_size.unwrap(),
+            400,
+        );
 
         let journal_db = journaldb::new(Arc::clone(&db), journaldb::Algorithm::Archive, COL_STATE);
         let state_db = StateDB::new(journal_db);
@@ -355,8 +369,6 @@ impl Chain {
             levels: LOG_BLOOMS_LEVELS,
             elements_per_index: LOG_BLOOMS_ELEMENTS_PER_INDEX,
         };
-
-        info!("chain config: {:?}", chain_config);
 
         let header = get_chain(&*db).unwrap_or_default();
         debug!("get chain head is : {:?}", header);
@@ -397,6 +409,8 @@ impl Chain {
             prooftype: chain_config.prooftype,
             proof_map: RwLock::new(BTreeMap::new()),
             is_snapshot: RwLock::new(false),
+            admin_address: RwLock::new(None),
+            version: RwLock::new(None),
         };
 
         if let Some(proto_proof) = chain.current_block_poof() {
@@ -417,7 +431,8 @@ impl Chain {
             BlockId::Number(number) => Some(number),
             BlockId::Hash(hash) => self.block_height_by_hash(hash),
             BlockId::Earliest => Some(0),
-            BlockId::Latest => Some(self.get_current_height()),
+            BlockId::Latest => Some(self.get_latest_height()),
+            BlockId::Pending => Some(self.get_pending_height()),
         }
     }
 
@@ -452,9 +467,10 @@ impl Chain {
             .map(|vecaddr| Address::from_slice(&vecaddr[..]))
             .collect();
         let block_interval = conf.get_block_interval();
+        let version = conf.get_version();
         debug!(
-            "consensus nodes {:?}, block_interval {:?}",
-            nodes, block_interval
+            "consensus nodes {:?}, block_interval {:?}, version {}",
+            nodes, block_interval, version
         );
 
         self.check_quota
@@ -464,11 +480,18 @@ impl Chain {
         *self.account_gas_limit.write() = conf.get_account_gas_limit().clone();
         *self.nodes.write() = nodes.clone();
         *self.block_interval.write() = block_interval;
+        *self.admin_address.write() = if conf.get_admin_address().is_empty() {
+            None
+        } else {
+            Some(Address::from(conf.get_admin_address()))
+        };
+        *self.version.write() = Some(version);
     }
 
     pub fn set_db_result(&self, ret: &ExecutedResult, block: &Block) {
         let info = ret.get_executed_info();
         let number = info.get_header().get_height();
+        let version = block.version();
         let mut hdr = Header::new();
         let log_bloom = LogBloom::from(info.get_header().get_log_bloom());
         hdr.set_gas_limit(U256::from(info.get_header().get_gas_limit()));
@@ -483,8 +506,15 @@ impl Chain {
         hdr.set_log_bloom(log_bloom);
         hdr.set_proof(block.proof().clone());
         hdr.set_proposer(Address::from(info.get_header().get_proposer()));
+        hdr.set_version(version);
 
         let hash = hdr.hash();
+        trace!(
+            "commit block in db hash {:?}, height {:?}, version {}",
+            hash,
+            number,
+            version
+        );
         let block_transaction_addresses = block.transaction_addresses(hash);
         let blocks_blooms: HashMap<LogGroupPosition, LogBloomGroup> = if log_bloom.is_zero() {
             HashMap::new()
@@ -646,6 +676,8 @@ impl Chain {
             Some(BlockInQueue::ConsensusBlock(block, _)) => {
                 if self.validate_height(block.number()) && self.validate_hash(block.parent_hash()) {
                     self.set_db_result(&ret, &block);
+                    let tx_hashes = block.body().transaction_hashes();
+                    self.delivery_block_tx_hashes(number, &tx_hashes, &ctx_pub);
                     self.broadcast_current_status(&ctx_pub);
                     debug!("executed set consensus block-{}", number);
                 }
@@ -693,11 +725,12 @@ impl Chain {
             BlockId::Hash(hash) => self.block_by_hash(hash),
             BlockId::Number(number) => self.block_by_height(number),
             BlockId::Earliest => self.block_by_height(0),
-            BlockId::Latest => self.block_by_height(self.get_current_height()),
+            BlockId::Latest => self.block_by_height(self.get_latest_height()),
+            BlockId::Pending => self.block_by_height(self.get_pending_height()),
         }
     }
 
-    // Get block by hash
+    /// Get block by hash
     pub fn block_by_hash(&self, hash: H256) -> Option<Block> {
         self.block_height_by_hash(hash)
             .and_then(|h| self.block_by_height(h))
@@ -720,11 +753,12 @@ impl Chain {
             BlockId::Hash(hash) => self.block_header_by_hash(hash),
             BlockId::Number(number) => self.block_header_by_height(number),
             BlockId::Earliest => self.block_header_by_height(0),
-            BlockId::Latest => self.block_header_by_height(self.get_current_height()),
+            BlockId::Latest => self.block_header_by_height(self.get_latest_height()),
+            BlockId::Pending => self.block_header_by_height(self.get_pending_height()),
         }
     }
 
-    // Get block header by hash
+    /// Get block header by hash
     pub fn block_header_by_hash(&self, hash: H256) -> Option<Header> {
         {
             let header = self.current_header.read();
@@ -757,7 +791,8 @@ impl Chain {
             BlockId::Hash(hash) => self.block_body_by_hash(hash),
             BlockId::Number(number) => self.block_body_by_height(number),
             BlockId::Earliest => self.block_body_by_height(0),
-            BlockId::Latest => self.block_body_by_height(self.get_current_height()),
+            BlockId::Latest => self.block_body_by_height(self.get_latest_height()),
+            BlockId::Pending => self.block_body_by_height(self.get_pending_height()),
         }
     }
 
@@ -765,7 +800,8 @@ impl Chain {
         self.block_header_by_height(height)
             .and_then(|hdr| Some(hdr.hash()))
     }
-    // Get block body by hash
+
+    /// Get block body by hash
     fn block_body_by_hash(&self, hash: H256) -> Option<BlockBody> {
         self.block_height_by_hash(hash)
             .and_then(|h| self.block_body_by_height(h))
@@ -997,27 +1033,43 @@ impl Chain {
         }
     }
 
+    #[inline]
     pub fn get_current_height(&self) -> u64 {
         self.current_height.load(Ordering::SeqCst) as u64
     }
 
+    #[inline]
+    pub fn get_pending_height(&self) -> u64 {
+        self.current_header.read().number()
+    }
+
+    #[inline]
+    pub fn get_latest_height(&self) -> u64 {
+        self.current_header.read().number().saturating_sub(1)
+    }
+
+    #[inline]
     pub fn get_current_hash(&self) -> H256 {
         self.current_header.read().hash()
     }
 
+    #[inline]
     pub fn get_max_store_height(&self) -> u64 {
         self.max_store_height.load(Ordering::SeqCst) as u64
     }
 
+    #[inline]
     pub fn set_max_store_height(&self, height: u64) {
         self.max_store_height
             .store(height as usize, Ordering::SeqCst);
     }
 
+    #[inline]
     pub fn current_state_root(&self) -> H256 {
         *self.current_header.read().state_root()
     }
 
+    #[inline]
     pub fn current_block_poof(&self) -> Option<ProtoProof> {
         self.db.read().read(db::COL_EXTRA, &CurrentProof)
     }
@@ -1163,12 +1215,24 @@ impl Chain {
         ctx_pub: &Sender<(String, Vec<u8>)>,
     ) {
         let ctx_pub_clone = ctx_pub.clone();
+        let version_opt = self.version.read();
+        if version_opt.is_none() {
+            trace!("delivery_block_tx_hashes : version is not ready!");
+            return;
+        }
         let mut block_tx_hashes = BlockTxHashes::new();
         block_tx_hashes.set_height(block_height);
         {
             block_tx_hashes.set_check_quota(self.check_quota.load(Ordering::Relaxed));
             block_tx_hashes.set_block_gas_limit(self.block_gas_limit.load(Ordering::SeqCst) as u64);
             block_tx_hashes.set_account_gas_limit(self.account_gas_limit.read().clone());
+            block_tx_hashes.set_admin_address(
+                self.admin_address
+                    .read()
+                    .map(|admin| admin.to_vec())
+                    .unwrap_or_else(Vec::new),
+            );
+            block_tx_hashes.set_version(version_opt.unwrap());
         }
 
         let mut tx_hashes_in_u8 = Vec::new();
@@ -1191,8 +1255,10 @@ impl Chain {
     /// Consensus should resend block if chain commit block failed.
     pub fn delivery_current_rich_status(&self, ctx_pub: &Sender<(String, Vec<u8>)>) {
         let header = &*self.current_header.read();
+        let version_opt = self.version.read();
 
-        if self.nodes.read().is_empty() {
+        if self.nodes.read().is_empty() || version_opt.is_none() {
+            trace!("delivery_current_rich_status : node list or version is not ready!");
             return;
         }
         let current_hash = header.hash();
@@ -1205,6 +1271,7 @@ impl Chain {
         rich_status.set_height(current_height);
         rich_status.set_nodes(nodes.into_iter().map(|address| address.to_vec()).collect());
         rich_status.set_interval(*block_interval);
+        rich_status.set_version(version_opt.unwrap());
 
         let msg: Message = rich_status.into();
         ctx_pub
@@ -1239,19 +1306,6 @@ impl Chain {
         status.set_hash(self.get_current_hash());
         status.set_number(self.get_current_height());
         status
-    }
-
-    // TODO: Need remove. Later the state may be moved back to chain, so keep it here.
-    /// Attempt to get a copy of a specific block's final state.
-    pub fn state_at(&self, id: BlockId) -> Option<State<StateDB>> {
-        self.block_header(id)
-            .and_then(|h| self.gen_state(*h.state_root()))
-    }
-
-    /// generate block's final state.
-    pub fn gen_state(&self, root: H256) -> Option<State<StateDB>> {
-        let db = self.state_db.read().boxed_clone();
-        State::from_existing(db, root).ok()
     }
 
     pub fn validate_hash(&self, block_hash: &H256) -> bool {

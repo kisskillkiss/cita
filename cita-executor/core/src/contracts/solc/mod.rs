@@ -18,18 +18,24 @@
 //! System contracts.
 
 pub mod chain_manager;
+pub mod emergency_brake;
 pub mod node_manager;
 pub mod permission_management;
+pub mod price_manager;
 pub mod quota_manager;
 pub mod sys_config;
 pub mod user_management;
+pub mod version_management;
 
 pub use self::chain_manager::ChainManagement;
+pub use self::emergency_brake::EmergencyBrake;
 pub use self::node_manager::NodeManager;
 pub use self::permission_management::{PermissionManagement, Resource};
+pub use self::price_manager::PriceManagement;
 pub use self::quota_manager::{AccountGasLimit, QuotaManager};
 pub use self::sys_config::SysConfig;
 pub use self::user_management::UserManagement;
+pub use self::version_management::VersionManager;
 
 use cita_types::Address;
 use libexecutor::call_request::CallRequest;
@@ -45,7 +51,7 @@ trait ContractCallExt {
         address: &Address,
         encoded_method: &[u8],
         from: Option<Address>,
-        block_id: Option<BlockId>,
+        block_id: BlockId,
     ) -> Result<Bytes, String>;
 }
 
@@ -55,14 +61,13 @@ impl ContractCallExt for Executor {
         address: &Address,
         encoded_method: &[u8],
         from: Option<Address>,
-        block_id: Option<BlockId>,
+        block_id: BlockId,
     ) -> Result<Bytes, String> {
         let call_request = CallRequest {
             from,
             to: *address,
             data: Some(encoded_method.to_vec()),
         };
-        let block_id = block_id.unwrap_or(BlockId::Latest);
         trace!("data: {:?}", call_request.data);
         self.eth_call(call_request, block_id)
     }

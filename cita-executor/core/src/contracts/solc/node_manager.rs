@@ -25,6 +25,7 @@ use libexecutor::executor::{EconomicalModel, Executor};
 use rand::{Rng, SeedableRng, StdRng};
 use std::iter;
 use std::str::FromStr;
+use types::ids::BlockId;
 use types::reserved_addresses;
 
 const LIST_NODE: &[u8] = &*b"listNode()";
@@ -73,32 +74,32 @@ impl<'a> NodeManager<'a> {
         NodeManager { executor, rng_seed }
     }
 
-    pub fn nodes(&self) -> Option<Vec<Address>> {
+    pub fn nodes(&self, block_id: BlockId) -> Option<Vec<Address>> {
         self.executor
             .call_method(
                 &*CONTRACT_ADDRESS,
                 &*LIST_NODE_ENCODED.as_slice(),
                 None,
-                None,
+                block_id,
             )
             .ok()
             .and_then(|output| decode_tools::to_address_vec(&output))
     }
 
-    pub fn stakes(&self) -> Option<Vec<u64>> {
+    pub fn stakes(&self, block_id: BlockId) -> Option<Vec<u64>> {
         self.executor
             .call_method(
                 &*CONTRACT_ADDRESS,
                 &*LIST_STAKE_ENCODED.as_slice(),
                 None,
-                None,
+                block_id,
             )
             .ok()
             .and_then(|output| decode_tools::to_u64_vec(&output))
     }
 
-    pub fn shuffled_stake_nodes(&self) -> Option<Vec<Address>> {
-        self.stake_nodes().map(|mut stake_nodes| {
+    pub fn shuffled_stake_nodes(&self, block_id: BlockId) -> Option<Vec<Address>> {
+        self.stake_nodes(block_id).map(|mut stake_nodes| {
             shuffle(&mut stake_nodes, self.rng_seed);
             stake_nodes
         })
@@ -109,12 +110,12 @@ impl<'a> NodeManager<'a> {
         Vec::new()
     }
 
-    pub fn stake_nodes(&self) -> Option<Vec<Address>> {
-        self.nodes().and_then(|nodes| {
+    pub fn stake_nodes(&self, block_id: BlockId) -> Option<Vec<Address>> {
+        self.nodes(block_id).and_then(|nodes| {
             if let EconomicalModel::Quota = *self.executor.economical_model.read() {
                 Some(nodes)
             } else {
-                self.stakes().map(|stakes| {
+                self.stakes(block_id).map(|stakes| {
                     let total: u64 = stakes.iter().sum();
                     if total == 0 {
                         nodes
@@ -137,6 +138,7 @@ mod tests {
     use cita_types::H160;
     use std::str::FromStr;
     use tests::helpers::init_executor;
+    use types::ids::BlockId;
 
     #[test]
     fn test_node_manager_contract() {
@@ -153,7 +155,7 @@ mod tests {
             ("NodeManager.stakes", "1,1,1,1"),
         ]);
         let node_manager = NodeManager::new(&executor, executor.genesis_header().timestamp());
-        let nodes = node_manager.nodes().unwrap();
+        let nodes = node_manager.nodes(BlockId::Pending).unwrap();
 
         assert_eq!(
             nodes,

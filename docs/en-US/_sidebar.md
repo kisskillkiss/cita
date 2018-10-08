@@ -2,7 +2,9 @@
 - Getting Started
     - [Build your own Appchain](chain/getting_started.md)
     - [Appchain Configuration](chain/config_tool.md)
+    - [Micro serives Configuration](chain/service_config.md)
 - System Management
+    - [System Contracts](system_management/contracts.md)
     - [Node Management](system_management/node.md)
     - [Permisson Management](system_management/permission.md)
     - [Account Management](system_management/user.md)
@@ -11,11 +13,14 @@
     - [System Management](system_management/sys.md)
     - [Snapshot](system_management/snapshot.md)
     - [Batch Tx](system_management/batch_tx.md)
-- Json-RPC Guide
-    - [Json-RPC List](rpc_guide/rpc.md)
-    - [Json-RPC Parameters and Returns](rpc_guide/rpc.md)
-    - [Json-RPC Error Code](rpc_guide/rpc_error_code.md)
-- [Transaction Tools](txtool.md)
+    - [Emergency Brake](system_management/emergency_brake.md)
+    - [Amend Data](system_management/amend.md)
+    - [Fee back](system_management/fee_back.md)
+    - [Protocol Version Management](system_management/version.md)
+- JSON-RPC Guide
+    - [JSON-RPC Parameters and Returns](rpc_guide/rpc_types.md)
+    - [JSON-RPC List](rpc_guide/rpc.md)
+    - [JSON-RPC Error Code](rpc_guide/rpc_error_code.md)
 - CITA Architecture
     - [Overall Architecture](architecture/architecture.md)
     - [Components](architecture/components.md)

@@ -80,7 +80,7 @@ impl BuildBlock {
         tx.set_data(data);
         tx.set_nonce(format!("{}", nonce));
         tx.set_quota(quota);
-        // 设置空，则创建合约
+        // create contract if `to_address` empty
         tx.set_to(to_address.to_string());
         tx.set_valid_until_block(valid_until_block);
         tx.set_value(vec![0u8; 32]);

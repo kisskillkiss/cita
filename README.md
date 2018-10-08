@@ -2,6 +2,8 @@
 
 [![Build Status](https://travis-ci.org/cryptape/cita.svg?branch=develop)](https://travis-ci.org/cryptape/cita)
 
+English | [简体中文](./README-CN.md)
+
 ## What is CITA
 
 CITA is a fast and scalable blockchain for enterprises. CITA supports both native contract and EVM contract, by which enterprise users can build their own blockchain applications. CITA has a unique architecture which enables enterprise users to release all their computing resources.
@@ -38,13 +40,13 @@ For more details please check the white paper.
 
 ## API/SDK
 
-CITA supports JSON-RPC and WebSocket (experimental) API/v1. 
+CITA supports JSON-RPC and WebSocket (experimental) API/v1.
 
 For CITA API/v1, You can use any HTTP client, or following SDKs:
 
-* [Java](https://github.com/cryptape/web3j)
+* [Java](https://github.com/cryptape/nervosj)
 * [Rust](https://github.com/cryptape/rust-web3)
-* [Javascript](https://github.com/cryptape/web3)
+* [JavaScript](https://github.com/cryptape/nervos.js)
 
 ## Contributing
 

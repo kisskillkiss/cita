@@ -149,16 +149,10 @@ fn main() {
         &chain_config,
     ));
 
-    let current_height = chain.get_current_height();
-    if let Some(block_tx_hashes) = chain.block_tx_hashes(current_height) {
-        chain.delivery_block_tx_hashes(current_height, &block_tx_hashes, &ctx_pub);
-    }
-
     let (write_sender, write_receiver) = channel();
     let forward = Forward::new(Arc::clone(&chain), ctx_pub.clone(), write_sender);
 
     let block_processor = BlockProcessor::new(Arc::clone(&chain), ctx_pub);
-    block_processor.broadcast_current_status();
 
     //chain 读写分离
     //chain 读数据 => 查询数据
@@ -199,13 +193,11 @@ fn main() {
     });
 
     //garbage collect
-    let mut i: u32 = 0;
     loop {
-        thread::sleep(time::Duration::from_millis(10_000));
-        if i > 100 {
+        thread::sleep(time::Duration::from_millis(1000));
+        if chain.cache_size().total() > chain_config.cache_size.unwrap() / 2 {
+            trace!("cache_manager begin collect garbage...");
             chain.collect_garbage();
-            i = 0;
         }
-        i += 1;
     }
 }

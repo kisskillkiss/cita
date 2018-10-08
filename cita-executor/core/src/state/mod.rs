@@ -25,6 +25,7 @@ use engines::Engine;
 use error::{Error, ExecutionError};
 use evm::env_info::EnvInfo;
 use evm::Error as EvmError;
+use evm::Schedule;
 use executive::{Executive, TransactOptions};
 use factory::Factories;
 use libexecutor::executor::{CheckOptions, EconomicalModel};
@@ -799,7 +800,7 @@ impl<B: Backend> State<B> {
             Ok(e) => {
                 // trace!("Applied transaction. Diff:\n{}\n", state_diff::diff_pod(&old, &self.to_pod()));
                 let receipt_error = e.exception.and_then(|evm_error| match evm_error {
-                    EvmError::OutOfGas => Some(ReceiptError::OutOfGas),
+                    EvmError::OutOfGas => Some(ReceiptError::OutOfQuota),
                     EvmError::BadJumpDestination { .. } => Some(ReceiptError::BadJumpDestination),
                     EvmError::BadInstruction { .. } => Some(ReceiptError::BadInstruction),
                     EvmError::StackUnderflow { .. } => Some(ReceiptError::StackUnderflow),
@@ -827,12 +828,14 @@ impl<B: Backend> State<B> {
             }
             Err(err) => {
                 let receipt_error = match err {
-                    ExecutionError::NotEnoughBaseGas { .. } => Some(ReceiptError::NotEnoughBaseGas),
+                    ExecutionError::NotEnoughBaseGas { .. } => {
+                        Some(ReceiptError::NotEnoughBaseQuota)
+                    }
                     ExecutionError::BlockGasLimitReached { .. } => {
-                        Some(ReceiptError::BlockGasLimitReached)
+                        Some(ReceiptError::BlockQuotaLimitReached)
                     }
                     ExecutionError::AccountGasLimitReached { .. } => {
-                        Some(ReceiptError::AccountGasLimitReached)
+                        Some(ReceiptError::AccountQuotaLimitReached)
                     }
                     ExecutionError::InvalidNonce { .. } => Some(ReceiptError::InvalidNonce),
                     ExecutionError::NotEnoughCash { .. } => Some(ReceiptError::NotEnoughCash),
@@ -850,28 +853,32 @@ impl<B: Backend> State<B> {
                         Some(ReceiptError::TransactionMalformed)
                     }
                 };
+                let schedule = Schedule::new_v1();
                 let sender = *t.sender();
                 let tx_gas_used = match err {
                     ExecutionError::ExecutionInternal { .. } => t.gas,
                     _ => cmp::min(
                         self.balance(&sender).unwrap_or_else(|_| U256::from(0)),
-                        U256::from(100),
+                        U256::from(schedule.tx_gas),
                     ),
                 };
+
                 if economical_model == EconomicalModel::Charge {
-                    let tx_fee_value = tx_gas_used * t.gas_price();
+                    let fee_value = tx_gas_used * t.gas_price();
+                    let sender_balance = self.balance(&sender).unwrap();
+
+                    let tx_fee_value = if fee_value > sender_balance {
+                        sender_balance
+                    } else {
+                        fee_value
+                    };
                     if let Err(err) = self.sub_balance(&sender, &tx_fee_value) {
                         error!("Sub balance from error transaction sender failed, tx_fee_value={}, error={:?}", tx_fee_value, err);
                     }
 
-                    if check_options.fee_back_platform {
-                        if chain_owner == Address::from(0) {
-                            self.add_balance(&env_info.author, &tx_fee_value)
-                                .expect("Add balance to author(miner) must success");
-                        } else {
-                            self.add_balance(&chain_owner, &tx_fee_value)
-                                .expect("Add balance to chain owner must success");
-                        }
+                    if check_options.fee_back_platform && chain_owner != Address::from(0) {
+                        self.add_balance(&chain_owner, &tx_fee_value)
+                            .expect("Add balance to chain owner must success");
                     } else {
                         self.add_balance(&env_info.author, &tx_fee_value)
                             .expect("Add balance to author(miner) must success");
